@@ -1,7 +1,7 @@
 [Unit]
-Description=GRE Tunnel (sudotunnel)
+Description=GRE tunnel and Iran port forward (sudotunnel)
 Wants=network-online.target
-After=network-online.target
+After=network-online.target netfilter-persistent.service ufw.service firewalld.service
 
 [Service]
 Type=oneshot

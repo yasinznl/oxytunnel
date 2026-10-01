@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# shellcheck source=/dev/null
+source /usr/local/lib/sudotunnel/lib.sh
+
+usage() {
+  cat <<'EOF'
+sudotunnel — GRE tunnel and Iran port forward
+
+Usage:
+  sudotunnel status
+  sudotunnel restart
+  sudotunnel port list
+  sudotunnel port add <port> [port...]
+  sudotunnel port del <port> [port...]
+  sudotunnel port set <port> [port...]
+  sudotunnel role iran|foreign
+
+Port changes are stored in /etc/sudotunnel.conf and applied by restarting
+the service. Forwarding is active only when this server's role is iran.
+On the foreign server the panel should listen on 0.0.0.0, and clients
+should connect to the Iran public IP.
+EOF
+}
+
+cmd_status() {
+  load_conf
+  local state="inactive"
+  if systemctl is-active --quiet sudotunnel.service; then
+    state="active"
+  fi
+  echo "role:    ${ROLE}"
+  echo "service: ${state}"
+  echo "public:  ${LOCAL_IP} -> ${REMOTE_IP}"
+  echo "tunnel:  ${TUN_IP}/${CIDR}  peer ${PEER_IP:-unset}  iface ${TUN_NAME}  mtu ${MTU}"
+  if [[ -n "${PORTS:-}" ]]; then
+    echo "ports:   ${PORTS}"
+  else
+    echo "ports:   (none)"
+  fi
+  if ip -4 -br addr show "$TUN_NAME" >/dev/null 2>&1; then
+    ip -4 -br addr show "$TUN_NAME"
+  else
+    echo "iface:   down"
+  fi
+  if [[ -n "${PEER_IP:-}" ]] && is_ipv4 "$PEER_IP" && command -v ping >/dev/null 2>&1; then
+    if ping -c 1 -W 2 "$PEER_IP" >/dev/null 2>&1; then
+      echo "ping:    ${PEER_IP} ok"
+    else
+      echo "ping:    ${PEER_IP} failed"
+    fi
+  fi
+  if [[ "$ROLE" == "iran" ]] && command -v iptables >/dev/null 2>&1; then
+    echo "dnat:"
+    ipt -t nat -S "$CHAIN_DNAT" 2>/dev/null || echo "  (no rules)"
+  fi
+}
+
+require_iran() {
+  load_conf
+  [[ "$ROLE" == "iran" ]] || die "This server is '${ROLE}'. Add or remove ports on the Iran server."
+}
+
+cmd_port_list() {
+  load_conf
+  if [[ -n "${PORTS:-}" ]]; then
+    echo "$PORTS"
+  else
+    echo "(none)"
+  fi
+}
+
+cmd_port_add() {
+  local add current merged
+  [[ $# -ge 1 ]] || die "Usage: sudotunnel port add <port> [port...]"
+  require_iran
+  add="$(parse_ports "$*")" || exit 1
+  current="$(parse_ports "${PORTS:-}")" || exit 1
+  merged="$(parse_ports "$current $add")" || exit 1
+  if [[ "$merged" == "$current" ]]; then
+    echo "Ports unchanged: ${merged}"
+    return 0
+  fi
+  conf_set PORTS "$merged"
+  restart_service
+  echo "Forwarding ${merged} to ${PEER_IP}"
+}
+
+cmd_port_del() {
+  local del p kept="" removed=0
+  [[ $# -ge 1 ]] || die "Usage: sudotunnel port del <port> [port...]"
+  require_iran
+  del="$(parse_ports "$*")" || exit 1
+  for p in $PORTS; do
+    case " $del " in
+      *" $p "*) removed=1 ;;
+      *) kept="${kept:+$kept }$p" ;;
+    esac
+  done
+  if [[ "$removed" -eq 0 ]]; then
+    echo "None of those ports are in the forward list."
+    return 0
+  fi
+  conf_set PORTS "$kept"
+  restart_service
+  if [[ -n "$kept" ]]; then
+    echo "Forwarding ${kept} to ${PEER_IP}"
+  else
+    echo "No ports are forwarded. The GRE tunnel is still up."
+  fi
+}
+
+cmd_port_set() {
+  local new current
+  [[ $# -ge 1 ]] || die "Usage: sudotunnel port set <port> [port...]"
+  require_iran
+  new="$(parse_ports "$*")" || exit 1
+  [[ -n "$new" ]] || die "Give at least one port."
+  current="$(parse_ports "${PORTS:-}")" || exit 1
+  if [[ "$new" == "$current" ]]; then
+    echo "Ports unchanged: ${new}"
+    return 0
+  fi
+  conf_set PORTS "$new"
+  restart_service
+  echo "Forwarding ${new} to ${PEER_IP}"
+}
+
+cmd_role() {
+  local new
+  [[ -n "${1:-}" ]] || die "Usage: sudotunnel role iran|foreign"
+  load_conf
+  new="$(normalize_role "$1")" || die "Role must be iran or foreign."
+  if [[ "$new" == "$ROLE" ]]; then
+    echo "Role unchanged: ${ROLE}"
+    return 0
+  fi
+  if [[ "$new" == "iran" && -z "${PORTS:-}" ]]; then
+    echo "Role will be iran. After this, add ports: sudotunnel port add 8028"
+  fi
+  conf_set ROLE "$new"
+  restart_service
+  echo "Role is ${new}"
+}
+
+main() {
+  local cmd="${1:-status}"
+  case "$cmd" in
+    -h|--help|help) usage; exit 0 ;;
+  esac
+  require_root
+  case "$cmd" in
+    status) cmd_status ;;
+    restart|reload)
+      load_conf
+      restart_service
+      echo "Restarted (${ROLE})."
+      ;;
+    port|ports)
+      shift
+      local sub="${1:-list}"
+      case "$sub" in
+        list) cmd_port_list ;;
+        add) shift; cmd_port_add "$@" ;;
+        del|delete|rm|remove) shift; cmd_port_del "$@" ;;
+        set) shift; cmd_port_set "$@" ;;
+        *) usage; exit 1 ;;
+      esac
+      ;;
+    role) shift; cmd_role "${1:-}" ;;
+    *) usage; exit 1 ;;
+  esac
+}
+
+main "$@"

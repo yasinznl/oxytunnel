@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CONF="/etc/sudotunnel.conf"
-[[ -f "$CONF" ]] || exit 0
-# shellcheck disable=SC1090
-source "$CONF"
+LIB="/usr/local/lib/sudotunnel/lib.sh"
+[[ -f "$LIB" ]] || exit 0
+# shellcheck source=/dev/null
+source "$LIB"
 
-ip tunnel del "$TUN_NAME" 2>/dev/null || true
+[[ -f "$CONF" ]] || exit 0
+load_conf
+remove_forwards
+bring_down

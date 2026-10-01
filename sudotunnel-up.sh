@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CONF="/etc/sudotunnel.conf"
-[[ -f "$CONF" ]] || { echo "Missing $CONF"; exit 1; }
-# shellcheck disable=SC1090
-source "$CONF"
+# shellcheck source=/dev/null
+source /usr/local/lib/sudotunnel/lib.sh
 
-ip tunnel del "$TUN_NAME" 2>/dev/null || true
-ip tunnel add "$TUN_NAME" mode gre remote "$REMOTE_IP" local "$LOCAL_IP" ttl 255
+require_root
+load_conf
+bring_up
 
-ip link set "$TUN_NAME" mtu "$MTU" up
-ip addr replace "${TUN_IP}/${CIDR}" dev "$TUN_NAME"
+case "$ROLE" in
+  iran) apply_forwards ;;
+  foreign) remove_forwards ;;
+esac
