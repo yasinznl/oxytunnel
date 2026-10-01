@@ -153,10 +153,12 @@ if [[ "$UNINSTALL" -eq 1 ]]; then
   exit 0
 fi
 
+REFRESH=0
 if [[ -x /usr/local/bin/oxytunnel && -f /usr/local/lib/oxytunnel/lib.sh \
    && "$ROLE_SET" -eq 0 && "$PORTS_SET" -eq 0 \
    && -z "$LOCAL_IP" && -z "$REMOTE_IP" && -z "$TUN_IP" && -z "$PEER_IP" ]]; then
-  exec /usr/local/bin/oxytunnel
+  REFRESH=1
+  echo "oxytunnel is already installed. Updating the script, then opening the menu."
 fi
 
 STAGE="$(mktemp -d)"
@@ -217,6 +219,14 @@ fi
 
 for asset in "${ASSETS[@]}"; do
   fetch_asset "$asset"
+  case "$asset" in
+    *.service|*.timer)
+      grep -q '^\[Unit\]' "$STAGE/$asset" || die "Download was not a valid unit file: $asset"
+      ;;
+    *)
+      bash -n "$STAGE/$asset" || die "Download was not a valid script: $asset"
+      ;;
+  esac
 done
 # shellcheck source=/dev/null
 source "$STAGE/oxytunnel-lib.sh"
@@ -261,8 +271,13 @@ if [[ "$CONFIGURE" -eq 1 ]]; then
 fi
 
 echo
-echo "Installation complete."
-echo "Choose New tunnel in the menu. The first question is iran or foreign."
+if [[ "$REFRESH" -eq 1 ]]; then
+  echo "Script updated."
+  echo "Open Tunnels, then Edit tunnel, and set Speed to fast or normal."
+else
+  echo "Installation complete."
+  echo "Choose New tunnel in the menu. The first question is iran or foreign."
+fi
 if [[ -t 0 && -t 1 ]]; then
   trap - EXIT
   rm -rf "$STAGE"

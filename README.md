@@ -18,7 +18,7 @@ The first question is the role of this machine. The public IP of this server is 
 - `iran` — forward the ports you enter to the foreign tunnel IP
 - `foreign` — bring up GRE only
 
-Running the installer again opens the menu when oxytunnel is already installed. The first install also opens the menu. Create the tunnel from New tunnel. The first question is `iran` or `foreign`, then `normal` or `fast`. `normal` is the standard tunnel. `fast` clamps TCP MSS and uses BBR so a download can fill the link. Set the same speed on both servers. Update script in the menu installs the latest files, then Edit tunnel can switch the speed.
+Running the installer again updates the script when oxytunnel is already installed, then opens the menu. The first install also opens the menu. Create the tunnel from New tunnel. The first question is `iran` or `foreign`, then `normal` or `fast`. `normal` is the standard tunnel. `fast` clamps TCP MSS and uses BBR so a download can fill the link. Set the same speed on both servers. Update script in the menu installs the latest files, then Edit tunnel can switch the speed.
 
 Use the same pair of tunnel addresses on both sides. `/31` is the simplest point-to-point prefix. `/30` also works; do not use the network or broadcast address.
 
