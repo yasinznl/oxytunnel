@@ -14,3 +14,4 @@ case "$ROLE" in
   iran) apply_forwards ;;
   foreign) remove_forwards ;;
 esac
+apply_mss

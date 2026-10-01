@@ -111,6 +111,8 @@ If clients time out while the peer answers ping, check the Iran port list and co
 
 Packet loss inside an otherwise working tunnel is often MTU. Re-run the installer with `--mtu 1400`, or set `MTU` in `/etc/oxytunnel.conf` and run `sudo oxytunnel restart`.
 
+Each start clamps TCP MSS to the tunnel MTU and, when the kernel allows it, switches congestion control to BBR with fair queuing. That lets a download use the link instead of stalling on oversized packets. Apply it on both servers: the foreign server sends the download, and the Iran server clamps the MSS.
+
 ## Requirements
 
 - Linux with systemd

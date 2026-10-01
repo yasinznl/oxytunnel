@@ -1,10 +1,11 @@
 [Unit]
 Description=GRE tunnel and port forward (oxytunnel)
-Wants=network-online.target
-After=network-online.target netfilter-persistent.service ufw.service firewalld.service
+After=network.target netfilter-persistent.service
 
 [Service]
 Type=oneshot
+TimeoutStartSec=60
+TimeoutStopSec=30
 ExecStart=/usr/local/bin/oxytunnel-up
 ExecStop=/usr/local/bin/oxytunnel-down
 RemainAfterExit=yes

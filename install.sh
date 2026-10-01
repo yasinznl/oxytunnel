@@ -120,9 +120,10 @@ uninstall_app() {
   if [[ -f /usr/local/lib/oxytunnel/lib.sh && -f "$CONF" ]]; then
     # shellcheck source=/dev/null
     source /usr/local/lib/oxytunnel/lib.sh
-    remove_forwards || true
     # shellcheck disable=SC1090
     source "$CONF" || true
+    TUN_NAME="${TUN_NAME:-oxytunnel}"
+    remove_forwards || true
     tun_name="${TUN_NAME:-oxytunnel}"
   fi
   ip tunnel del "$tun_name" >/dev/null 2>&1 || true

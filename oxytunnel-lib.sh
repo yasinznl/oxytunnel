@@ -10,6 +10,7 @@ RUN_DIR="/run/${APP}"
 CHAIN_DNAT="OXYTUNNEL_DNAT"
 CHAIN_SNAT="OXYTUNNEL_SNAT"
 CHAIN_FWD="OXYTUNNEL_FWD"
+CHAIN_MSS="OXYTUNNEL_MSS"
 UNIT="${APP}.service"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
@@ -139,15 +140,104 @@ log_event() {
   return 0
 }
 
-persist_ip_forward() {
+write_sysctl() {
+  local cc="cubic"
+  modprobe tcp_bbr 2>/dev/null || true
+  modprobe sch_fq 2>/dev/null || true
+  if sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
+    cc="bbr"
+  fi
   mkdir -p /etc/sysctl.d
-  printf 'net.ipv4.ip_forward=1\n' >"$SYSCTL_FILE"
-  sysctl -w net.ipv4.ip_forward=1 >/dev/null
+  {
+    echo "# Managed by oxytunnel."
+    if [[ "${ROLE:-}" == "iran" ]]; then
+      echo "net.ipv4.ip_forward=1"
+    fi
+    echo "net.ipv4.tcp_mtu_probing=1"
+    echo "net.ipv4.tcp_slow_start_after_idle=0"
+    echo "net.core.rmem_max=16777216"
+    echo "net.core.wmem_max=16777216"
+    echo "net.ipv4.tcp_rmem=4096 87380 16777216"
+    echo "net.ipv4.tcp_wmem=4096 65536 16777216"
+    echo "net.ipv4.tcp_congestion_control=${cc}"
+    if [[ "$cc" == "bbr" ]]; then
+      echo "net.core.default_qdisc=fq"
+      echo "net.ipv4.tcp_notsent_lowat=16384"
+    fi
+  } >"$SYSCTL_FILE"
+  sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1 || true
+  sysctl -w net.ipv4.tcp_mtu_probing=1 >/dev/null 2>&1 || true
+  sysctl -w net.ipv4.tcp_slow_start_after_idle=0 >/dev/null 2>&1 || true
+  sysctl -w net.core.rmem_max=16777216 >/dev/null 2>&1 || true
+  sysctl -w net.core.wmem_max=16777216 >/dev/null 2>&1 || true
+  sysctl -w net.ipv4.tcp_congestion_control="$cc" >/dev/null 2>&1 || true
+  if [[ "$cc" == "bbr" ]]; then
+    sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.tcp_notsent_lowat=16384 >/dev/null 2>&1 || true
+  fi
+  if [[ "${ROLE:-}" == "iran" ]]; then
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+  fi
+}
+
+persist_ip_forward() {
+  write_sysctl
+}
+
+tune_interface() {
+  ip link set "$TUN_NAME" txqueuelen 10000 2>/dev/null || true
+  if command -v ethtool >/dev/null 2>&1; then
+    ethtool -K "$TUN_NAME" gso on gro on tso on >/dev/null 2>&1 || true
+  fi
+  if command -v tc >/dev/null 2>&1; then
+    tc qdisc replace dev "$TUN_NAME" root fq >/dev/null 2>&1 || true
+  fi
+  write_sysctl
+}
+
+remove_mss() {
+  command -v iptables >/dev/null 2>&1 || return 0
+  [[ -n "${TUN_NAME:-}" ]] || return 0
+  while ipt -t mangle -D PREROUTING -i "$TUN_NAME" -j "$CHAIN_MSS" >/dev/null 2>&1; do
+    :
+  done
+  while ipt -t mangle -D POSTROUTING -o "$TUN_NAME" -j "$CHAIN_MSS" >/dev/null 2>&1; do
+    :
+  done
+  ipt -t mangle -F "$CHAIN_MSS" >/dev/null 2>&1 || true
+  ipt -t mangle -X "$CHAIN_MSS" >/dev/null 2>&1 || true
+  return 0
+}
+
+apply_mss() {
+  local mss
+  command -v iptables >/dev/null 2>&1 || return 0
+  [[ -n "${TUN_NAME:-}" ]] || return 0
+  [[ "${MTU:-}" =~ ^[0-9]+$ ]] || return 0
+  mss=$(( 10#$MTU - 40 ))
+  if (( mss < 536 || mss > 8960 )); then
+    return 0
+  fi
+  remove_mss
+  ipt -t mangle -N "$CHAIN_MSS" >/dev/null 2>&1 || true
+  ipt -t mangle -I PREROUTING 1 -i "$TUN_NAME" -j "$CHAIN_MSS"
+  ipt -t mangle -I POSTROUTING 1 -o "$TUN_NAME" -j "$CHAIN_MSS"
+  ipt -t mangle -F "$CHAIN_MSS"
+  if ! ipt -t mangle -A "$CHAIN_MSS" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$mss"; then
+    log_event warn "TCP MSS clamp failed; download speed may stay low"
+    return 0
+  fi
+  save_iptables
+  log_event notice "TCP MSS clamped to ${mss} on ${TUN_NAME}"
 }
 
 save_iptables() {
   if command -v netfilter-persistent >/dev/null 2>&1; then
-    netfilter-persistent save >/dev/null 2>&1 || true
+    if command -v timeout >/dev/null 2>&1; then
+      timeout 15 netfilter-persistent save >/dev/null 2>&1 || true
+    else
+      netfilter-persistent save >/dev/null 2>&1 || true
+    fi
     return 0
   fi
   if [[ -d /etc/iptables ]] && command -v iptables-save >/dev/null 2>&1; then
@@ -184,6 +274,7 @@ remove_forwards() {
   drop_chain nat PREROUTING "$CHAIN_DNAT"
   drop_chain nat POSTROUTING "$CHAIN_SNAT"
   drop_chain filter FORWARD "$CHAIN_FWD"
+  remove_mss
   save_iptables
 }
 
@@ -230,6 +321,7 @@ bring_up() {
   ip tunnel add "$TUN_NAME" mode gre remote "$REMOTE_IP" local "$LOCAL_IP" ttl 255
   ip link set "$TUN_NAME" mtu "$MTU" up
   ip addr replace "${TUN_IP}/${CIDR}" dev "$TUN_NAME"
+  tune_interface
 }
 
 bring_down() {
