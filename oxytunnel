@@ -43,6 +43,7 @@ cmd_status() {
     state="active"
   fi
   echo "role:    ${ROLE}"
+  echo "speed:   ${SPEED}"
   echo "service: ${state}"
   echo "public:  ${LOCAL_IP} -> ${REMOTE_IP}"
   echo "tunnel:  ${TUN_IP}/${CIDR}  peer ${PEER_IP:-unset}  iface ${TUN_NAME}  mtu ${MTU}"
@@ -239,6 +240,8 @@ cmd_new_tunnel() {
   TUN_IP=""
   PEER_IP=""
   PORTS=""
+  SPEED=""
+  SPEED_SET=0
   CIDR="30"
   MTU="1476"
   TUN_NAME="oxytunnel"
@@ -340,7 +343,7 @@ cmd_health() {
 }
 
 cmd_edit_tunnel() {
-  local d_role="" d_local="" d_remote="" d_tun="" d_peer="" d_ports=""
+  local d_role="" d_local="" d_remote="" d_tun="" d_peer="" d_ports="" d_speed=""
   [[ -f "$CONF" ]] || { echo "  No tunnel is configured."; return 0; }
   load_conf
   d_role="$ROLE"
@@ -349,14 +352,18 @@ cmd_edit_tunnel() {
   d_tun="$TUN_IP"
   d_peer="$PEER_IP"
   d_ports="$PORTS"
+  d_speed="${SPEED:-normal}"
   ROLE=""
   LOCAL_IP=""
   REMOTE_IP=""
   TUN_IP=""
   PEER_IP=""
   PORTS=""
+  SPEED=""
   echo
   echo "  Edit tunnel. Press Enter to keep the current value."
+  echo "  normal is the standard tunnel. fast uses the full link."
+  echo "  Set the same speed on both servers."
   echo
   while true; do
     ask_line ROLE "Role of this server (iran or foreign)" "$d_role"
@@ -365,6 +372,14 @@ cmd_edit_tunnel() {
     fi
     echo "  Enter iran or foreign."
     ROLE=""
+  done
+  while true; do
+    ask_line SPEED "Speed (normal or fast)" "$d_speed"
+    if SPEED="$(normalize_speed "$SPEED")"; then
+      break
+    fi
+    echo "  Enter normal or fast."
+    SPEED=""
   done
   while ! is_ipv4 "${LOCAL_IP:-}"; do
     ask_line LOCAL_IP "Public IP of this server" "$d_local"
@@ -417,28 +432,66 @@ cmd_delete_tunnel() {
   echo "  Tunnel deleted. The script is still installed."
 }
 
-fetch_release_file() {
-  local name="$1" dest="$2" url="${BASE_URL}/${name}"
-  if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$url" -o "$dest"
-  elif command -v wget >/dev/null 2>&1; then
-    wget -qO "$dest" "$url"
-  else
-    echo "  curl or wget is required to update."
+release_file_ok() {
+  local name="$1" dest="$2" line
+  [[ -s "$dest" ]] || return 1
+  if grep -qi '<html' "$dest"; then
     return 1
   fi
-  [[ -s "$dest" ]] || { echo "  Download failed: ${url}"; return 1; }
+  line="$(head -n 1 "$dest" 2>/dev/null || true)"
+  case "$name" in
+    *.service|*.timer)
+      grep -q '^\[Unit\]' "$dest" || return 1
+      ;;
+    *)
+      [[ "$line" == '#!'* ]] || return 1
+      bash -n "$dest" || return 1
+      ;;
+  esac
+  return 0
+}
+
+fetch_release_file() {
+  local name="$1" dest="$2" url errf stamp
+  local -a urls=()
+  stamp="$(date +%s)"
+  urls=(
+    "https://raw.githubusercontent.com/yasinznl/oxytunnel/main/${name}?t=${stamp}"
+    "https://github.com/yasinznl/oxytunnel/raw/refs/heads/main/${name}?t=${stamp}"
+    "https://cdn.jsdelivr.net/gh/yasinznl/oxytunnel@main/${name}?t=${stamp}"
+  )
+  errf="$(mktemp)"
+  if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+    echo "  curl or wget is required to update."
+    rm -f "$errf"
+    return 1
+  fi
+  for url in "${urls[@]}"; do
+    rm -f "$dest"
+    if command -v curl >/dev/null 2>&1; then
+      if curl -fL --retry 2 --retry-delay 1 --connect-timeout 20 --max-time 90 "$url" -o "$dest" 2>"$errf"; then
+        if release_file_ok "$name" "$dest"; then
+          rm -f "$errf"
+          return 0
+        fi
+      fi
+    elif wget -q -O "$dest" "$url" 2>"$errf"; then
+      if release_file_ok "$name" "$dest"; then
+        rm -f "$errf"
+        return 0
+      fi
+    fi
+  done
+  echo "  Download failed: ${name}"
+  if [[ -s "$errf" ]]; then
+    tail -n 2 "$errf" | sed 's/^/  /'
+  fi
+  rm -f "$errf" "$dest"
+  return 1
 }
 
 cmd_update() {
   local answer="" stage="" was_active=0 asset
-  printf '%b' "${C_YELLOW}  Download and install the latest script? [y/N]:${C_RESET} "
-  read -r answer || true
-  [[ "${answer:-}" =~ ^[Yy]$ ]] || { echo "  Cancelled."; return 0; }
-  if systemctl is-active --quiet "$UNIT"; then
-    was_active=1
-  fi
-  stage="$(mktemp -d)"
   local -a assets=(
     oxytunnel-lib.sh
     oxytunnel-up.sh
@@ -449,9 +502,21 @@ cmd_update() {
     oxytunnel-health.service
     oxytunnel-health.timer
   )
+  printf '%b' "${C_YELLOW}  Download and install the latest script? [y/N]:${C_RESET} "
+  read -r answer || true
+  [[ "${answer:-}" =~ ^[Yy]$ ]] || { echo "  Cancelled."; return 0; }
+  if systemctl is-active --quiet "$UNIT"; then
+    was_active=1
+  fi
+  stage="$(mktemp -d)"
   echo "  Downloading..."
   for asset in "${assets[@]}"; do
-    fetch_release_file "$asset" "${stage}/${asset}" || { rm -rf "$stage"; return 1; }
+    echo "  ${asset}"
+    if ! fetch_release_file "$asset" "${stage}/${asset}"; then
+      rm -rf "$stage"
+      echo "  Update stopped. The installed script was not changed."
+      return 1
+    fi
   done
   install -d /usr/local/bin /usr/local/lib/oxytunnel /etc/systemd/system
   install -m 0644 "${stage}/oxytunnel-lib.sh" /usr/local/lib/oxytunnel/lib.sh
@@ -466,10 +531,12 @@ cmd_update() {
   systemctl daemon-reload
   systemctl enable oxytunnel-health.timer >/dev/null 2>&1 || true
   if [[ "$was_active" -eq 1 && -f "$CONF" ]]; then
+    echo "  Restarting the tunnel..."
     systemctl restart "$UNIT" || true
   fi
   log_event notice "script updated from ${BASE_URL}"
-  echo "  Update installed. Opening the new menu."
+  echo "  Update installed."
+  echo "  Open Tunnels, then Edit tunnel, and set Speed to fast or normal."
   exec /usr/local/bin/oxytunnel
 }
 
@@ -536,6 +603,7 @@ cmd_tunnels() {
     printf '  %-14s %-10s %-8s %s\n' "NAME" "ROLE" "STATE" "PUBLIC"
     printf '  %-14s %-10s %-8s %s\n' "$TUN_NAME" "$ROLE" "$state" "${LOCAL_IP} -> ${REMOTE_IP}"
     printf '  %-14s %s\n' "TUNNEL" "${TUN_IP}/${CIDR} -> ${PEER_IP}"
+    printf '  %-14s %s\n' "SPEED" "$SPEED"
     if [[ -n "${PORTS:-}" ]]; then
       printf '  %-14s %s\n' "PORTS" "$PORTS"
     else

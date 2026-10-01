@@ -18,7 +18,7 @@ The first question is the role of this machine. The public IP of this server is 
 - `iran` — forward the ports you enter to the foreign tunnel IP
 - `foreign` — bring up GRE only
 
-Running the installer again opens the menu when oxytunnel is already installed. The first install also opens the menu. Create the tunnel from New tunnel; the first question is `iran` or `foreign`.
+Running the installer again opens the menu when oxytunnel is already installed. The first install also opens the menu. Create the tunnel from New tunnel. The first question is `iran` or `foreign`, then `normal` or `fast`. `normal` is the standard tunnel. `fast` clamps TCP MSS and uses BBR so a download can fill the link. Set the same speed on both servers. Update script in the menu installs the latest files, then Edit tunnel can switch the speed.
 
 Use the same pair of tunnel addresses on both sides. `/31` is the simplest point-to-point prefix. `/30` also works; do not use the network or broadcast address.
 
@@ -111,7 +111,7 @@ If clients time out while the peer answers ping, check the Iran port list and co
 
 Packet loss inside an otherwise working tunnel is often MTU. Re-run the installer with `--mtu 1400`, or set `MTU` in `/etc/oxytunnel.conf` and run `sudo oxytunnel restart`.
 
-Each start clamps TCP MSS to the tunnel MTU and, when the kernel allows it, switches congestion control to BBR with fair queuing. That lets a download use the link instead of stalling on oversized packets. Apply it on both servers: the foreign server sends the download, and the Iran server clamps the MSS.
+`fast` clamps TCP MSS to the tunnel MTU and, when the kernel allows it, switches congestion control to BBR. `normal` leaves the standard TCP settings. Change it from Tunnels, then Edit tunnel. Use the same speed on both servers, then reconnect the client.
 
 ## Requirements
 

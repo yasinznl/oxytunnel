@@ -25,6 +25,7 @@ Options:
   --mtu <N>                Tunnel MTU (default: 1476)
   --name <ifname>          Tunnel interface name (default: oxytunnel)
   --role <iran|foreign>    iran forwards ports; foreign only brings up GRE
+  --speed <normal|fast>    normal is the standard tunnel; fast uses the full link
   --ports <list>           Ports to forward on the Iran server (space or comma separated)
   --uninstall              Remove service, health timer, scripts, config, and forward chains
   -h, --help               Show help
@@ -57,8 +58,10 @@ MTU="1476"
 TUN_NAME="oxytunnel"
 ROLE=""
 PORTS=""
+SPEED=""
 ROLE_SET=0
 PORTS_SET=0
+SPEED_SET=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -70,6 +73,7 @@ while [[ $# -gt 0 ]]; do
     --mtu) MTU="${2:-}"; shift 2 ;;
     --name) TUN_NAME="${2:-}"; shift 2 ;;
     --role) ROLE="${2:-}"; ROLE_SET=1; shift 2 ;;
+    --speed) SPEED="${2:-}"; SPEED_SET=1; shift 2 ;;
     --ports) PORTS="${2:-}"; PORTS_SET=1; shift 2 ;;
     --uninstall) UNINSTALL=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -160,23 +164,32 @@ cleanup() { rm -rf "$STAGE"; }
 trap cleanup EXIT
 
 download() {
-  local url="$1" out="$2"
-  if has curl; then
-    curl -fsSL "$url" -o "$out"
-  elif has wget; then
-    wget -qO "$out" "$url"
-  else
-    die "Missing dependency: curl or wget"
-  fi
-  [[ -s "$out" ]] || die "Download failed: $url"
+  local out="$1"
+  shift
+  local url
+  for url in "$@"; do
+    if has curl; then
+      curl -fL --retry 2 --retry-delay 1 --connect-timeout 20 --max-time 90 "$url" -o "$out" && [[ -s "$out" ]] && return 0
+    elif has wget; then
+      wget -q -O "$out" "$url" && [[ -s "$out" ]] && return 0
+    else
+      die "Missing dependency: curl or wget"
+    fi
+    rm -f "$out"
+  done
+  die "Download failed: $1"
 }
 
 fetch_asset() {
-  local name="$1"
+  local name="$1" stamp
+  stamp="$(date +%s)"
   if [[ -n "$SCRIPT_DIR" && -f "$SCRIPT_DIR/$name" ]]; then
     cp "$SCRIPT_DIR/$name" "$STAGE/$name"
   else
-    download "$BASE_URL/$name" "$STAGE/$name"
+    download "$STAGE/$name" \
+      "${BASE_URL}/${name}?t=${stamp}" \
+      "https://github.com/yasinznl/oxytunnel/raw/refs/heads/main/${name}?t=${stamp}" \
+      "https://cdn.jsdelivr.net/gh/yasinznl/oxytunnel@main/${name}?t=${stamp}"
   fi
   [[ -s "$STAGE/$name" ]] || die "Missing installer file: $name"
 }

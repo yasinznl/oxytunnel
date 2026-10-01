@@ -42,6 +42,18 @@ normalize_role() {
   esac
 }
 
+normalize_speed() {
+  local s
+  s="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  case "$s" in
+    normal|standard) printf '%s\n' "normal" ;;
+    fast) printf '%s\n' "fast" ;;
+    *) return 1 ;;
+  esac
+}
+
 # Print a unique space-separated port list. Empty input is valid.
 parse_ports() {
   local raw="${1:-}" p out="" part
@@ -113,6 +125,9 @@ load_conf() {
   if ! PORTS="$(parse_ports "$PORTS")"; then
     die "Invalid PORTS in $CONF"
   fi
+  if ! SPEED="$(normalize_speed "${SPEED:-normal}")"; then
+    die "Invalid SPEED in $CONF (use normal or fast)"
+  fi
 }
 
 log_event() {
@@ -141,11 +156,14 @@ log_event() {
 }
 
 write_sysctl() {
-  local cc="cubic"
-  modprobe tcp_bbr 2>/dev/null || true
-  modprobe sch_fq 2>/dev/null || true
-  if sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
-    cc="bbr"
+  local cc="cubic" fast=0
+  if [[ "${SPEED:-normal}" == "fast" ]]; then
+    fast=1
+    modprobe tcp_bbr 2>/dev/null || true
+    modprobe sch_fq 2>/dev/null || true
+    if sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
+      cc="bbr"
+    fi
   fi
   mkdir -p /etc/sysctl.d
   {
@@ -153,27 +171,39 @@ write_sysctl() {
     if [[ "${ROLE:-}" == "iran" ]]; then
       echo "net.ipv4.ip_forward=1"
     fi
-    echo "net.ipv4.tcp_mtu_probing=1"
-    echo "net.ipv4.tcp_slow_start_after_idle=0"
-    echo "net.core.rmem_max=16777216"
-    echo "net.core.wmem_max=16777216"
-    echo "net.ipv4.tcp_rmem=4096 87380 16777216"
-    echo "net.ipv4.tcp_wmem=4096 65536 16777216"
-    echo "net.ipv4.tcp_congestion_control=${cc}"
-    if [[ "$cc" == "bbr" ]]; then
-      echo "net.core.default_qdisc=fq"
-      echo "net.ipv4.tcp_notsent_lowat=16384"
+    if [[ "$fast" -eq 1 ]]; then
+      echo "net.ipv4.tcp_mtu_probing=1"
+      echo "net.ipv4.tcp_slow_start_after_idle=0"
+      echo "net.core.rmem_max=16777216"
+      echo "net.core.wmem_max=16777216"
+      echo "net.ipv4.tcp_rmem=4096 87380 16777216"
+      echo "net.ipv4.tcp_wmem=4096 65536 16777216"
+      echo "net.ipv4.tcp_congestion_control=${cc}"
+      if [[ "$cc" == "bbr" ]]; then
+        echo "net.core.default_qdisc=fq"
+        echo "net.ipv4.tcp_notsent_lowat=16384"
+      fi
+    else
+      echo "net.ipv4.tcp_congestion_control=cubic"
+      echo "net.core.default_qdisc=fq_codel"
+      echo "net.ipv4.tcp_slow_start_after_idle=1"
     fi
   } >"$SYSCTL_FILE"
   sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1 || true
-  sysctl -w net.ipv4.tcp_mtu_probing=1 >/dev/null 2>&1 || true
-  sysctl -w net.ipv4.tcp_slow_start_after_idle=0 >/dev/null 2>&1 || true
-  sysctl -w net.core.rmem_max=16777216 >/dev/null 2>&1 || true
-  sysctl -w net.core.wmem_max=16777216 >/dev/null 2>&1 || true
-  sysctl -w net.ipv4.tcp_congestion_control="$cc" >/dev/null 2>&1 || true
-  if [[ "$cc" == "bbr" ]]; then
-    sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || true
-    sysctl -w net.ipv4.tcp_notsent_lowat=16384 >/dev/null 2>&1 || true
+  if [[ "$fast" -eq 1 ]]; then
+    sysctl -w net.ipv4.tcp_mtu_probing=1 >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.tcp_slow_start_after_idle=0 >/dev/null 2>&1 || true
+    sysctl -w net.core.rmem_max=16777216 >/dev/null 2>&1 || true
+    sysctl -w net.core.wmem_max=16777216 >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.tcp_congestion_control="$cc" >/dev/null 2>&1 || true
+    if [[ "$cc" == "bbr" ]]; then
+      sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || true
+      sysctl -w net.ipv4.tcp_notsent_lowat=16384 >/dev/null 2>&1 || true
+    fi
+  else
+    sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1 || true
+    sysctl -w net.core.default_qdisc=fq_codel >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.tcp_slow_start_after_idle=1 >/dev/null 2>&1 || true
   fi
   if [[ "${ROLE:-}" == "iran" ]]; then
     sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
@@ -185,12 +215,19 @@ persist_ip_forward() {
 }
 
 tune_interface() {
-  ip link set "$TUN_NAME" txqueuelen 10000 2>/dev/null || true
-  if command -v ethtool >/dev/null 2>&1; then
-    ethtool -K "$TUN_NAME" gso on gro on tso on >/dev/null 2>&1 || true
-  fi
-  if command -v tc >/dev/null 2>&1; then
-    tc qdisc replace dev "$TUN_NAME" root fq >/dev/null 2>&1 || true
+  if [[ "${SPEED:-normal}" == "fast" ]]; then
+    ip link set "$TUN_NAME" txqueuelen 10000 2>/dev/null || true
+    if command -v ethtool >/dev/null 2>&1; then
+      ethtool -K "$TUN_NAME" gso on gro on tso on >/dev/null 2>&1 || true
+    fi
+    if command -v tc >/dev/null 2>&1; then
+      tc qdisc replace dev "$TUN_NAME" root fq >/dev/null 2>&1 || true
+    fi
+  else
+    ip link set "$TUN_NAME" txqueuelen 1000 2>/dev/null || true
+    if command -v tc >/dev/null 2>&1; then
+      tc qdisc del dev "$TUN_NAME" root >/dev/null 2>&1 || true
+    fi
   fi
   write_sysctl
 }
@@ -497,6 +534,7 @@ assert_tunnel_settings() {
   (( MTU >= 576 && MTU <= 9000 )) || die "MTU must be between 576 and 9000."
   [[ "$TUN_NAME" =~ ^[A-Za-z0-9._:-]{1,15}$ ]] || die "Invalid interface name."
   ROLE="$(normalize_role "${ROLE:-}")" || die "Role must be iran or foreign."
+  SPEED="$(normalize_speed "${SPEED:-normal}")" || die "Speed must be normal or fast."
   if [[ "$ROLE" == "iran" ]]; then
     PORTS="$(parse_ports "${PORTS:-}")" || die "Invalid port list."
     [[ -n "$PORTS" ]] || die "The Iran side needs at least one port."
@@ -534,6 +572,7 @@ CIDR="${CIDR}"
 MTU="${MTU}"
 ROLE="${ROLE}"
 PORTS="${PORTS}"
+SPEED="${SPEED}"
 EOF
   chmod 600 "$CONF"
   umask "$old_umask"
@@ -656,5 +695,21 @@ collect_tunnel_answers() {
       echo "Ports are forwarded only on the Iran server. Ignoring --ports here."
     fi
     PORTS=""
+  fi
+  if [[ "${SPEED_SET:-0}" -eq 1 || -n "${SPEED:-}" ]]; then
+    SPEED="$(normalize_speed "${SPEED:-}")" || die "Invalid speed. Use normal or fast."
+  elif [[ -t 0 ]]; then
+    echo "normal keeps the standard tunnel. fast uses the full link (MSS clamp and BBR)."
+    echo "Set the same speed on both servers."
+    while true; do
+      ask_line SPEED "Speed (normal or fast)" "normal"
+      if SPEED="$(normalize_speed "$SPEED")"; then
+        break
+      fi
+      echo "Enter normal or fast."
+      SPEED=""
+    done
+  else
+    SPEED="normal"
   fi
 }

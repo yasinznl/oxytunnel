@@ -8,10 +8,15 @@ require_root
 load_conf
 trap 'log_event err "tunnel start failed on ${TUN_NAME:-oxytunnel}"' ERR
 bring_up
-log_event notice "tunnel ${TUN_NAME} is up, role ${ROLE}, peer ${PEER_IP}"
+log_event notice "tunnel ${TUN_NAME} is up, role ${ROLE}, speed ${SPEED:-normal}, peer ${PEER_IP}"
 
 case "$ROLE" in
   iran) apply_forwards ;;
   foreign) remove_forwards ;;
 esac
-apply_mss
+if [[ "${SPEED:-normal}" == "fast" ]]; then
+  apply_mss
+else
+  remove_mss
+  save_iptables
+fi
