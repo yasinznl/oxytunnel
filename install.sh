@@ -148,6 +148,12 @@ if [[ "$UNINSTALL" -eq 1 ]]; then
   exit 0
 fi
 
+if [[ -x /usr/local/bin/oxytunnel && -f /usr/local/lib/oxytunnel/lib.sh \
+   && "$ROLE_SET" -eq 0 && "$PORTS_SET" -eq 0 \
+   && -z "$LOCAL_IP" && -z "$REMOTE_IP" && -z "$TUN_IP" && -z "$PEER_IP" ]]; then
+  exec /usr/local/bin/oxytunnel
+fi
+
 STAGE="$(mktemp -d)"
 cleanup() { rm -rf "$STAGE"; }
 trap cleanup EXIT
@@ -201,14 +207,22 @@ done
 # shellcheck source=/dev/null
 source "$STAGE/oxytunnel-lib.sh"
 
-collect_tunnel_answers
-assert_tunnel_settings
-ensure_iran_packages
+CONFIGURE=0
+if [[ "$ROLE_SET" -eq 1 || "$PORTS_SET" -eq 1 || -n "$LOCAL_IP" || -n "$REMOTE_IP" || -n "$TUN_IP" || -n "$PEER_IP" ]]; then
+  CONFIGURE=1
+fi
+if [[ "$CONFIGURE" -eq 1 ]]; then
+  collect_tunnel_answers
+  assert_tunnel_settings
+  ensure_iran_packages
+fi
 
 retire_legacy
 
 install -d /etc /usr/local/bin /usr/local/lib/oxytunnel
-write_tunnel_conf
+if [[ "$CONFIGURE" -eq 1 ]]; then
+  write_tunnel_conf
+fi
 
 install -m 0644 "$STAGE/oxytunnel-lib.sh" /usr/local/lib/oxytunnel/lib.sh
 install -m 0755 "$STAGE/oxytunnel-up.sh" "/usr/local/bin/${APP}-up"
@@ -222,17 +236,19 @@ touch "/var/log/${APP}.log"
 chmod 640 "/var/log/${APP}.log"
 
 systemctl daemon-reload
-systemctl enable "${APP}.service" >/dev/null
 systemctl enable oxytunnel-health.timer >/dev/null
-if ! systemctl restart "${APP}.service"; then
-  journalctl -u "${APP}.service" -n 40 --no-pager >&2 || true
-  die "Service failed to start."
-fi
 systemctl start oxytunnel-health.timer >/dev/null 2>&1 || echo "WARNING: health timer did not start. Check: systemctl status oxytunnel-health.timer"
+if [[ "$CONFIGURE" -eq 1 ]]; then
+  systemctl enable "${APP}.service" >/dev/null
+  if ! systemctl restart "${APP}.service"; then
+    journalctl -u "${APP}.service" -n 40 --no-pager >&2 || true
+    die "Service failed to start."
+  fi
+fi
 
 echo
 echo "Installation complete."
-echo "GRE is IP protocol 47 and is not encrypted."
+echo "Choose New tunnel in the menu. The first question is iran or foreign."
 if [[ -t 0 && -t 1 ]]; then
   trap - EXIT
   rm -rf "$STAGE"

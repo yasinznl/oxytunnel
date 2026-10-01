@@ -18,7 +18,7 @@ The first question is the role of this machine. The public IP of this server is 
 - `iran` — forward the ports you enter to the foreign tunnel IP
 - `foreign` — bring up GRE only
 
-When the installer is running in a terminal, it opens the management menu after the tunnel is up.
+Running the installer again opens the menu when oxytunnel is already installed. The first install also opens the menu. Create the tunnel from New tunnel; the first question is `iran` or `foreign`.
 
 Use the same pair of tunnel addresses on both sides. `/31` is the simplest point-to-point prefix. `/30` also works; do not use the network or broadcast address.
 
