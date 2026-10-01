@@ -255,31 +255,316 @@ cmd_new_tunnel() {
   echo "  Tunnel saved and restarted."
 }
 
-cmd_tunnels() {
-  local state="down"
+cmd_start() {
+  if [[ ! -f "$CONF" ]]; then
+    echo "  No tunnel is configured."
+    return 0
+  fi
+  if systemctl is-active --quiet "$UNIT" && ip link show "$(conf_get TUN_NAME)" >/dev/null 2>&1; then
+    echo "  Tunnel is already running."
+    return 0
+  fi
+  systemctl enable "$UNIT" >/dev/null
+  systemctl start "$UNIT"
+  log_event notice "tunnel started from the menu"
+  echo "  Tunnel started."
+}
+
+cmd_health() {
+  local svc="unknown" flags="" addr="" ping_out="" loss="" result="healthy" tone="$C_GREEN"
   echo
-  printf '%b\n' "${C_BOLD}  Tunnels${C_RESET}"
+  printf '%b\n' "${C_BOLD}  Health check${C_RESET}"
   ui_rule
   if [[ ! -f "$CONF" ]]; then
     echo "  No tunnel is configured."
-    echo "  Choose New tunnel to create one."
     ui_rule
     return 0
   fi
   load_conf
-  if systemctl is-active --quiet "$UNIT" && ip link show "$TUN_NAME" >/dev/null 2>&1; then
-    state="up"
-  fi
-  printf '  %-14s %-10s %-8s %s\n' "NAME" "ROLE" "STATE" "PUBLIC"
-  printf '  %-14s %-10s %-8s %s\n' "$TUN_NAME" "$ROLE" "$state" "${LOCAL_IP} -> ${REMOTE_IP}"
-  printf '  %-14s %s\n' "TUNNEL" "${TUN_IP}/${CIDR} -> ${PEER_IP}"
-  if [[ -n "${PORTS:-}" ]]; then
-    printf '  %-14s %s\n' "PORTS" "$PORTS"
+  svc="$(systemctl is-active "$UNIT" 2>/dev/null || true)"
+  [[ -n "$svc" ]] || svc="unknown"
+  printf '  %-14s %s\n' "Service" "$svc"
+  if ip link show "$TUN_NAME" >/dev/null 2>&1; then
+    flags="$(ip -o link show "$TUN_NAME" 2>/dev/null | awk '{print $3}')"
+    if [[ "$flags" == *UP* ]]; then
+      printf '  %-14s %b%s%b\n' "Interface" "$C_GREEN" "up" "$C_RESET"
+    else
+      printf '  %-14s %b%s%b\n' "Interface" "$C_RED" "down" "$C_RESET"
+      result="failed"
+      tone="$C_RED"
+    fi
   else
-    printf '  %-14s %s\n' "PORTS" "none"
+    printf '  %-14s %b%s%b\n' "Interface" "$C_RED" "missing" "$C_RESET"
+    result="failed"
+    tone="$C_RED"
+  fi
+  addr="$(ip -4 addr show dev "$TUN_NAME" 2>/dev/null || true)"
+  if [[ "$addr" == *"inet ${TUN_IP}/"* || "$addr" == *"inet ${TUN_IP} "* ]]; then
+    printf '  %-14s %s\n' "Address" "${TUN_IP}/${CIDR}"
+  else
+    printf '  %-14s %b%s%b\n' "Address" "$C_RED" "missing" "$C_RESET"
+    result="failed"
+    tone="$C_RED"
+  fi
+  if [[ -z "${PEER_IP:-}" ]]; then
+    printf '  %-14s %b%s%b\n' "Peer" "$C_RED" "not set" "$C_RESET"
+    result="failed"
+    tone="$C_RED"
+  elif ! command -v ping >/dev/null 2>&1; then
+    printf '  %-14s %s\n' "Peer" "ping is not installed"
+    result="failed"
+    tone="$C_RED"
+  else
+    ping_out="$(ping -c 3 -W 2 "$PEER_IP" 2>&1 || true)"
+    loss="$(printf '%s\n' "$ping_out" | awk -F',' '/packets transmitted/ {gsub(/^ +/,"",$2); print $2; exit}')"
+    if printf '%s\n' "$ping_out" | grep -q "bytes from"; then
+      printf '  %-14s %b%s%b\n' "Peer" "$C_GREEN" "${PEER_IP} reachable (${loss:-reply received})" "$C_RESET"
+    else
+      printf '  %-14s %b%s%b\n' "Peer" "$C_RED" "${PEER_IP} did not answer" "$C_RESET"
+      result="failed"
+      tone="$C_RED"
+    fi
+  fi
+  if [[ "$ROLE" == "iran" ]]; then
+    if command -v iptables >/dev/null 2>&1 && ipt -t nat -S "$CHAIN_DNAT" >/dev/null 2>&1; then
+      printf '  %-14s %s\n' "Forward" "${PORTS:-none}"
+    else
+      printf '  %-14s %b%s%b\n' "Forward" "$C_RED" "rules missing" "$C_RESET"
+      result="failed"
+      tone="$C_RED"
+    fi
   fi
   ui_rule
-  echo "  This host runs one GRE tunnel."
+  printf '  %-14s %b%s%b\n' "Result" "$tone" "$result" "$C_RESET"
+  log_event notice "manual health check result=${result} service=${svc} peer=${PEER_IP:-unset}"
+}
+
+cmd_edit_tunnel() {
+  local d_role="" d_local="" d_remote="" d_tun="" d_peer="" d_ports=""
+  [[ -f "$CONF" ]] || { echo "  No tunnel is configured."; return 0; }
+  load_conf
+  d_role="$ROLE"
+  d_local="$LOCAL_IP"
+  d_remote="$REMOTE_IP"
+  d_tun="$TUN_IP"
+  d_peer="$PEER_IP"
+  d_ports="$PORTS"
+  ROLE=""
+  LOCAL_IP=""
+  REMOTE_IP=""
+  TUN_IP=""
+  PEER_IP=""
+  PORTS=""
+  echo
+  echo "  Edit tunnel. Press Enter to keep the current value."
+  echo
+  while true; do
+    ask_line ROLE "Role of this server (iran or foreign)" "$d_role"
+    if ROLE="$(normalize_role "$ROLE")"; then
+      break
+    fi
+    echo "  Enter iran or foreign."
+    ROLE=""
+  done
+  while ! is_ipv4 "${LOCAL_IP:-}"; do
+    ask_line LOCAL_IP "Public IP of this server" "$d_local"
+  done
+  while ! is_ipv4 "${REMOTE_IP:-}"; do
+    ask_line REMOTE_IP "Public IP of the other server" "$d_remote"
+  done
+  while ! is_ipv4 "${TUN_IP:-}"; do
+    ask_line TUN_IP "Tunnel IP on this server" "$d_tun"
+  done
+  while ! is_ipv4 "${PEER_IP:-}"; do
+    ask_line PEER_IP "Tunnel IP on the other server" "$d_peer"
+  done
+  if [[ "$ROLE" == "iran" ]]; then
+    while [[ -z "$PORTS" ]]; do
+      ask_line PORTS "Ports to forward (example: 443 8443)" "$d_ports"
+      if ! PORTS="$(parse_ports "$PORTS")"; then
+        echo "  Use ports from 1 to 65535, separated by spaces or commas."
+        PORTS=""
+        d_ports=""
+        continue
+      fi
+      [[ -n "$PORTS" ]] || echo "  Enter at least one port."
+    done
+  else
+    PORTS=""
+  fi
+  assert_tunnel_settings
+  ensure_iran_packages
+  write_tunnel_conf
+  restart_service
+  log_event notice "tunnel edited from the menu"
+  echo "  Tunnel updated and restarted."
+}
+
+cmd_delete_tunnel() {
+  local answer=""
+  [[ -f "$CONF" ]] || { echo "  No tunnel is configured."; return 0; }
+  printf '%b' "${C_YELLOW}  Delete this tunnel? [y/N]:${C_RESET} "
+  read -r answer || true
+  [[ "${answer:-}" =~ ^[Yy]$ ]] || { echo "  Cancelled."; return 0; }
+  load_conf
+  systemctl stop "$UNIT" >/dev/null 2>&1 || true
+  systemctl disable "$UNIT" >/dev/null 2>&1 || true
+  remove_forwards || true
+  ip tunnel del "$TUN_NAME" >/dev/null 2>&1 || true
+  rm -f "$CONF"
+  rm -rf "$RUN_DIR"
+  log_event notice "tunnel deleted from the menu"
+  echo "  Tunnel deleted. The script is still installed."
+}
+
+fetch_release_file() {
+  local name="$1" dest="$2" url="${BASE_URL}/${name}"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$url" -o "$dest"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO "$dest" "$url"
+  else
+    echo "  curl or wget is required to update."
+    return 1
+  fi
+  [[ -s "$dest" ]] || { echo "  Download failed: ${url}"; return 1; }
+}
+
+cmd_update() {
+  local answer="" stage="" was_active=0 asset
+  printf '%b' "${C_YELLOW}  Download and install the latest script? [y/N]:${C_RESET} "
+  read -r answer || true
+  [[ "${answer:-}" =~ ^[Yy]$ ]] || { echo "  Cancelled."; return 0; }
+  if systemctl is-active --quiet "$UNIT"; then
+    was_active=1
+  fi
+  stage="$(mktemp -d)"
+  local -a assets=(
+    oxytunnel-lib.sh
+    oxytunnel-up.sh
+    oxytunnel-down.sh
+    oxytunnel-health.sh
+    oxytunnel
+    oxytunnel.service
+    oxytunnel-health.service
+    oxytunnel-health.timer
+  )
+  echo "  Downloading..."
+  for asset in "${assets[@]}"; do
+    fetch_release_file "$asset" "${stage}/${asset}" || { rm -rf "$stage"; return 1; }
+  done
+  install -d /usr/local/bin /usr/local/lib/oxytunnel /etc/systemd/system
+  install -m 0644 "${stage}/oxytunnel-lib.sh" /usr/local/lib/oxytunnel/lib.sh
+  install -m 0755 "${stage}/oxytunnel-up.sh" /usr/local/bin/oxytunnel-up
+  install -m 0755 "${stage}/oxytunnel-down.sh" /usr/local/bin/oxytunnel-down
+  install -m 0755 "${stage}/oxytunnel-health.sh" /usr/local/bin/oxytunnel-health
+  install -m 0755 "${stage}/oxytunnel" /usr/local/bin/oxytunnel
+  install -m 0644 "${stage}/oxytunnel.service" /etc/systemd/system/oxytunnel.service
+  install -m 0644 "${stage}/oxytunnel-health.service" /etc/systemd/system/oxytunnel-health.service
+  install -m 0644 "${stage}/oxytunnel-health.timer" /etc/systemd/system/oxytunnel-health.timer
+  rm -rf "$stage"
+  systemctl daemon-reload
+  systemctl enable oxytunnel-health.timer >/dev/null 2>&1 || true
+  if [[ "$was_active" -eq 1 && -f "$CONF" ]]; then
+    systemctl restart "$UNIT" || true
+  fi
+  log_event notice "script updated from ${BASE_URL}"
+  echo "  Update installed. Opening the new menu."
+  exec /usr/local/bin/oxytunnel
+}
+
+cmd_uninstall() {
+  local answer="" tun_name="oxytunnel"
+  echo
+  echo "  This removes oxytunnel, the tunnel, forwards, config, and log."
+  printf '%b' "${C_RED}  Type yes to uninstall:${C_RESET} "
+  read -r answer || true
+  [[ "${answer:-}" == "yes" ]] || { echo "  Cancelled."; pause_menu; return 0; }
+  systemctl disable --now oxytunnel-health.timer >/dev/null 2>&1 || true
+  systemctl stop "$UNIT" >/dev/null 2>&1 || true
+  systemctl disable "$UNIT" >/dev/null 2>&1 || true
+  if [[ -f "$CONF" ]]; then
+    # shellcheck disable=SC1090
+    source "$CONF" || true
+    tun_name="${TUN_NAME:-oxytunnel}"
+    remove_forwards || true
+  fi
+  ip tunnel del "$tun_name" >/dev/null 2>&1 || true
+  ip tunnel del sudotunnel >/dev/null 2>&1 || true
+  rm -f \
+    /usr/local/bin/oxytunnel \
+    /usr/local/bin/oxytunnel-up \
+    /usr/local/bin/oxytunnel-down \
+    /usr/local/bin/oxytunnel-health \
+    /etc/systemd/system/oxytunnel.service \
+    /etc/systemd/system/oxytunnel-health.service \
+    /etc/systemd/system/oxytunnel-health.timer \
+    /etc/oxytunnel.conf \
+    /etc/sysctl.d/99-oxytunnel.conf \
+    /var/log/oxytunnel.log \
+    /usr/local/bin/sudotunnel \
+    /usr/local/bin/sudotunnel-up \
+    /usr/local/bin/sudotunnel-down \
+    /etc/systemd/system/sudotunnel.service \
+    /etc/sudotunnel.conf \
+    /etc/sysctl.d/99-sudotunnel.conf
+  rm -rf /usr/local/lib/oxytunnel /usr/local/lib/sudotunnel /run/oxytunnel
+  systemctl daemon-reload || true
+  echo "  Oxytunnel has been uninstalled."
+  exit 0
+}
+
+cmd_tunnels() {
+  local choice="" state="down"
+  while true; do
+    echo
+    printf '%b\n' "${C_BOLD}  Tunnels${C_RESET}"
+    ui_rule
+    if [[ ! -f "$CONF" ]]; then
+      echo "  No tunnel is configured."
+      echo "  Create one with New tunnel."
+      ui_rule
+      pause_menu
+      return 0
+    fi
+    load_conf
+    if systemctl is-active --quiet "$UNIT" && ip link show "$TUN_NAME" >/dev/null 2>&1; then
+      state="up"
+    else
+      state="down"
+    fi
+    printf '  %-14s %-10s %-8s %s\n' "NAME" "ROLE" "STATE" "PUBLIC"
+    printf '  %-14s %-10s %-8s %s\n' "$TUN_NAME" "$ROLE" "$state" "${LOCAL_IP} -> ${REMOTE_IP}"
+    printf '  %-14s %s\n' "TUNNEL" "${TUN_IP}/${CIDR} -> ${PEER_IP}"
+    if [[ -n "${PORTS:-}" ]]; then
+      printf '  %-14s %s\n' "PORTS" "$PORTS"
+    else
+      printf '  %-14s %s\n' "PORTS" "none"
+    fi
+    ui_rule
+    echo "  1   Start"
+    echo "  2   Stop"
+    echo "  3   Tunnel log"
+    echo "  4   Edit tunnel"
+    echo "  5   Ports"
+    echo "  6   Delete tunnel"
+    echo "  0   Back"
+    printf '%b' "${C_CYAN}  Select:${C_RESET} "
+    if ! read -r choice; then
+      echo
+      return 0
+    fi
+    case "$choice" in
+      1) cmd_start || true; pause_menu ;;
+      2) cmd_stop || true; pause_menu ;;
+      3) echo; cmd_log 40 || true; pause_menu ;;
+      4) ( cmd_edit_tunnel ) || true; pause_menu ;;
+      5) cmd_ports_menu || true ;;
+      6) cmd_delete_tunnel || true; pause_menu; [[ -f "$CONF" ]] || return 0 ;;
+      0|back) return 0 ;;
+      *) echo "  Choose an option from the list."; pause_menu ;;
+    esac
+  done
 }
 
 cmd_stop() {
@@ -336,18 +621,15 @@ cmd_ports_menu() {
 }
 
 cmd_menu() {
-  local choice="" role=""
+  local choice=""
   while true; do
     menu_banner
     echo "  1   Status"
     echo "  2   New tunnel"
     echo "  3   Tunnels"
-    echo "  4   Logs"
-    echo "  5   Restart tunnel"
-    echo "  6   Stop tunnel"
-    echo "  7   Health check"
-    echo "  8   Ports"
-    echo "  9   Change role"
+    echo "  4   Health check"
+    echo "  5   Update script"
+    echo "  6   Uninstall script"
     echo "  0   Exit"
     ui_rule
     printf '%b' "${C_DIM}  root only${C_RESET}  ${C_CYAN}Select an option:${C_RESET} "
@@ -358,27 +640,10 @@ cmd_menu() {
     case "$choice" in
       1) cmd_status || true; pause_menu ;;
       2) ( cmd_new_tunnel ) || true; pause_menu ;;
-      3) cmd_tunnels || true; pause_menu ;;
-      4) echo; cmd_log 40 || true; pause_menu ;;
-      5)
-        if [[ -f "$CONF" ]]; then
-          ( load_conf; restart_service; echo "  Tunnel restarted." ) || true
-        else
-          echo "  No tunnel is configured."
-        fi
-        pause_menu
-        ;;
-      6) cmd_stop || true; pause_menu ;;
-      7) ( watch_tunnel ) || true; echo "  Health check finished."; pause_menu ;;
-      8) cmd_ports_menu || true ;;
-      9)
-        printf '  Role (iran or foreign): '
-        read -r role || true
-        if [[ -n "${role:-}" ]]; then
-          ( cmd_role "$role" ) || true
-        fi
-        pause_menu
-        ;;
+      3) cmd_tunnels || true ;;
+      4) cmd_health || true; pause_menu ;;
+      5) cmd_update || true; pause_menu ;;
+      6) cmd_uninstall || true ;;
       0|q|Q|exit) break ;;
       *) echo "  Choose an option from the list."; pause_menu ;;
     esac
@@ -405,7 +670,7 @@ main() {
     tunnels) cmd_tunnels ;;
     stop) cmd_stop ;;
     status) cmd_status ;;
-    health|check) watch_tunnel; echo "Health check finished." ;;
+    health|check) cmd_health ;;
     log|logs) shift || true; cmd_log "${1:-40}" ;;
     restart|reload)
       load_conf

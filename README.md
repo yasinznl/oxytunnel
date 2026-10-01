@@ -57,7 +57,7 @@ Management is root-only. One command opens the menu:
 sudo oxytunnel
 ```
 
-The menu lists status, new tunnel, tunnels, logs, restart, stop, health check, ports, and role. The same actions exist as commands:
+The main menu has status, new tunnel, tunnels, health check, update, and uninstall. Inside Tunnels: start, stop, tunnel log, edit, ports, and delete. The same actions exist as commands:
 
 ```bash
 sudo oxytunnel status

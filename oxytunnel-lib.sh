@@ -2,6 +2,7 @@
 # Shared helpers for oxytunnel. Sourced by the installer, the CLI, and systemd scripts.
 
 APP="oxytunnel"
+BASE_URL="https://raw.githubusercontent.com/yasinznl/oxytunnel/main"
 CONF="/etc/${APP}.conf"
 SYSCTL_FILE="/etc/sysctl.d/99-${APP}.conf"
 LOG_FILE="/var/log/${APP}.log"
@@ -251,7 +252,7 @@ restart_service() {
 
 # Print a reason and return 1 when the tunnel is not usable.
 probe_tunnel() {
-  local flags
+  local flags="" addr=""
   if ! ip link show "$TUN_NAME" >/dev/null 2>&1; then
     printf '%s\n' "interface ${TUN_NAME} is missing"
     return 1
@@ -261,7 +262,8 @@ probe_tunnel() {
     printf '%s\n' "interface ${TUN_NAME} is down"
     return 1
   fi
-  if ! ip -4 addr show dev "$TUN_NAME" 2>/dev/null | grep -q "inet ${TUN_IP}/"; then
+  addr="$(ip -4 addr show dev "$TUN_NAME" 2>/dev/null || true)"
+  if [[ "$addr" != *"inet ${TUN_IP}/"* && "$addr" != *"inet ${TUN_IP} "* ]]; then
     printf '%s\n' "address ${TUN_IP} is missing on ${TUN_NAME}"
     return 1
   fi
