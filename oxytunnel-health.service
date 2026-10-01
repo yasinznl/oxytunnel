@@ -1,0 +1,7 @@
+[Unit]
+Description=oxytunnel health check
+After=oxytunnel.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/oxytunnel-health

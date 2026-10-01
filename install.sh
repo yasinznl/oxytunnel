@@ -1,25 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP="sudotunnel"
+APP="oxytunnel"
 CONF="/etc/${APP}.conf"
-BASE_URL="https://raw.githubusercontent.com/yasinznl/sudotunnel/main"
+BASE_URL="https://raw.githubusercontent.com/yasinznl/oxytunnel/main"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 need_root() { [[ ${EUID:-0} -eq 0 ]] || die "Run as root."; }
 has() { command -v "$1" >/dev/null 2>&1; }
 
 prompt() {
-  local var="$1" msg="$2" def="${3:-}" val=""
-  if [[ -n "$def" ]]; then
-    if ! read -r -p "$msg [$def]: " val; then
-      die "Input closed before the answer was given."
-    fi
-    val="${val:-$def}"
-  else
-    if ! read -r -p "$msg: " val; then
-      die "Input closed before the answer was given."
-    fi
+  local var="$1" msg="$2" val=""
+  if ! read -r -p "$msg: " val; then
+    die "Input closed before the answer was given."
   fi
   printf -v "$var" '%s' "$val"
 }
@@ -32,34 +25,31 @@ Usage:
   sudo ./install.sh [options]
 
 Options:
-  --local-ip <IPv4>        Public IP of THIS server
+  --local-ip <IPv4>        Public IP of this server
   --remote-ip <IPv4>       Public IP of the other server
-  --tun-ip <IPv4>          Tunnel IP on THIS server
+  --tun-ip <IPv4>          Tunnel IP on this server
   --peer-ip <IPv4>         Tunnel IP on the other server
   --cidr <N>               Tunnel prefix (default: 30). /31 is the safest point-to-point size
   --mtu <N>                Tunnel MTU (default: 1476)
-  --name <ifname>          Tunnel interface name (default: sudotunnel)
+  --name <ifname>          Tunnel interface name (default: oxytunnel)
   --role <iran|foreign>    iran forwards ports; foreign only brings up GRE
   --ports <list>           Ports to forward on the Iran server (space or comma separated)
-  --uninstall              Remove service, scripts, config, and port-forward chains
+  --uninstall              Remove service, health timer, scripts, config, and forward chains
   -h, --help               Show help
 
 Examples:
-  sudo ./install.sh --local-ip 10.1.1.1 --remote-ip 10.2.2.2 --tun-ip 10.10.0.10 --peer-ip 10.10.0.9 --cidr 30 --role iran --ports 8028,443
-  sudo ./install.sh --local-ip 10.2.2.2 --remote-ip 10.1.1.1 --tun-ip 10.10.0.9 --peer-ip 10.10.0.10 --cidr 30 --role foreign
+  sudo ./install.sh --local-ip 203.0.113.10 --remote-ip 203.0.113.20 --tun-ip 10.200.0.1 --peer-ip 10.200.0.2 --cidr 30 --role iran --ports 443,8443
+  sudo ./install.sh --local-ip 203.0.113.20 --remote-ip 203.0.113.10 --tun-ip 10.200.0.2 --peer-ip 10.200.0.1 --cidr 30 --role foreign
 
 After install:
-  sudotunnel status
-  sudotunnel port add 8443
-  sudotunnel port del 8443
-  sudotunnel restart
+  sudo oxytunnel
 EOF
 }
 
 SCRIPT_DIR=""
 if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
   if dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null)"; then
-    if [[ -f "$dir/sudotunnel-lib.sh" ]]; then
+    if [[ -f "$dir/oxytunnel-lib.sh" ]]; then
       SCRIPT_DIR="$dir"
     fi
   fi
@@ -72,12 +62,9 @@ TUN_IP=""
 PEER_IP=""
 CIDR="30"
 MTU="1476"
-TUN_NAME="sudotunnel"
+TUN_NAME="oxytunnel"
 ROLE=""
 PORTS=""
-CIDR_SET=0
-MTU_SET=0
-NAME_SET=0
 ROLE_SET=0
 PORTS_SET=0
 
@@ -87,9 +74,9 @@ while [[ $# -gt 0 ]]; do
     --remote-ip) REMOTE_IP="${2:-}"; shift 2 ;;
     --tun-ip) TUN_IP="${2:-}"; shift 2 ;;
     --peer-ip) PEER_IP="${2:-}"; shift 2 ;;
-    --cidr) CIDR="${2:-}"; CIDR_SET=1; shift 2 ;;
-    --mtu) MTU="${2:-}"; MTU_SET=1; shift 2 ;;
-    --name) TUN_NAME="${2:-}"; NAME_SET=1; shift 2 ;;
+    --cidr) CIDR="${2:-}"; shift 2 ;;
+    --mtu) MTU="${2:-}"; shift 2 ;;
+    --name) TUN_NAME="${2:-}"; shift 2 ;;
     --role) ROLE="${2:-}"; ROLE_SET=1; shift 2 ;;
     --ports) PORTS="${2:-}"; PORTS_SET=1; shift 2 ;;
     --uninstall) UNINSTALL=1; shift ;;
@@ -102,29 +89,64 @@ need_root
 has ip || die "Missing dependency: ip (iproute2)"
 has systemctl || die "Missing dependency: systemctl (systemd)"
 
+drop_named_chain() {
+  local table="$1" parent="$2" chain="$3"
+  has iptables || return 0
+  while iptables -w 5 -t "$table" -D "$parent" -j "$chain" >/dev/null 2>&1; do
+    :
+  done
+  iptables -w 5 -t "$table" -F "$chain" >/dev/null 2>&1 || true
+  iptables -w 5 -t "$table" -X "$chain" >/dev/null 2>&1 || true
+}
+
+retire_legacy() {
+  systemctl disable --now sudotunnel.service >/dev/null 2>&1 || true
+  systemctl disable --now sudotunnel-health.timer >/dev/null 2>&1 || true
+  ip tunnel del sudotunnel >/dev/null 2>&1 || true
+  drop_named_chain nat PREROUTING SUDOTUNNEL_DNAT
+  drop_named_chain nat POSTROUTING SUDOTUNNEL_SNAT
+  drop_named_chain filter FORWARD SUDOTUNNEL_FWD
+  rm -f \
+    /usr/local/bin/sudotunnel \
+    /usr/local/bin/sudotunnel-up \
+    /usr/local/bin/sudotunnel-down \
+    /usr/local/bin/sudotunnel-health \
+    /etc/systemd/system/sudotunnel.service \
+    /etc/systemd/system/sudotunnel-health.service \
+    /etc/systemd/system/sudotunnel-health.timer \
+    /etc/sudotunnel.conf \
+    /etc/sysctl.d/99-sudotunnel.conf
+  rm -rf /usr/local/lib/sudotunnel
+  systemctl daemon-reload || true
+}
+
 uninstall_app() {
-  local tun_name="sudotunnel"
-  systemctl stop "${APP}.service" >/dev/null 2>&1 || true
-  systemctl disable "${APP}.service" >/dev/null 2>&1 || true
-  if [[ -f /usr/local/lib/sudotunnel/lib.sh ]]; then
+  local tun_name="oxytunnel"
+  systemctl disable --now oxytunnel-health.timer >/dev/null 2>&1 || true
+  systemctl stop oxytunnel.service >/dev/null 2>&1 || true
+  systemctl disable oxytunnel.service >/dev/null 2>&1 || true
+  if [[ -f /usr/local/lib/oxytunnel/lib.sh && -f "$CONF" ]]; then
     # shellcheck source=/dev/null
-    source /usr/local/lib/sudotunnel/lib.sh
+    source /usr/local/lib/oxytunnel/lib.sh
     remove_forwards || true
-  fi
-  if [[ -f "$CONF" ]]; then
     # shellcheck disable=SC1090
     source "$CONF" || true
-    tun_name="${TUN_NAME:-sudotunnel}"
+    tun_name="${TUN_NAME:-oxytunnel}"
   fi
-  ip tunnel del "$tun_name" 2>/dev/null || true
+  ip tunnel del "$tun_name" >/dev/null 2>&1 || true
+  retire_legacy
   rm -f \
     "/usr/local/bin/${APP}-up" \
     "/usr/local/bin/${APP}-down" \
+    "/usr/local/bin/${APP}-health" \
     "/usr/local/bin/${APP}" \
     "/etc/systemd/system/${APP}.service" \
+    "/etc/systemd/system/${APP}-health.service" \
+    "/etc/systemd/system/${APP}-health.timer" \
     "$CONF" \
-    /etc/sysctl.d/99-sudotunnel.conf
-  rm -rf /usr/local/lib/sudotunnel
+    "/etc/sysctl.d/99-${APP}.conf" \
+    "/var/log/${APP}.log"
+  rm -rf "/usr/local/lib/${APP}" /run/oxytunnel
   systemctl daemon-reload || true
   echo "Uninstalled ${APP}."
 }
@@ -160,8 +182,19 @@ fetch_asset() {
   [[ -s "$STAGE/$name" ]] || die "Missing installer file: $name"
 }
 
+ASSETS=(
+  oxytunnel-lib.sh
+  oxytunnel-up.sh
+  oxytunnel-down.sh
+  oxytunnel-health.sh
+  oxytunnel
+  oxytunnel.service
+  oxytunnel-health.service
+  oxytunnel-health.timer
+)
+
 need_download=0
-for asset in sudotunnel-lib.sh sudotunnel-up.sh sudotunnel-down.sh sudotunnel sudotunnel.service; do
+for asset in "${ASSETS[@]}"; do
   if [[ -z "$SCRIPT_DIR" || ! -f "$SCRIPT_DIR/$asset" ]]; then
     need_download=1
   fi
@@ -170,38 +203,23 @@ if [[ "$need_download" -eq 1 ]]; then
   has curl || has wget || die "Missing dependency: curl or wget"
 fi
 
-fetch_asset sudotunnel-lib.sh
-fetch_asset sudotunnel-up.sh
-fetch_asset sudotunnel-down.sh
-fetch_asset sudotunnel
-fetch_asset sudotunnel.service
+for asset in "${ASSETS[@]}"; do
+  fetch_asset "$asset"
+done
 # shellcheck source=/dev/null
-source "$STAGE/sudotunnel-lib.sh"
-
-if [[ "$CIDR_SET" -eq 0 ]]; then
-  prev="$(conf_get CIDR)"
-  [[ -n "$prev" ]] && CIDR="$prev"
-fi
-if [[ "$MTU_SET" -eq 0 ]]; then
-  prev="$(conf_get MTU)"
-  [[ -n "$prev" ]] && MTU="$prev"
-fi
-if [[ "$NAME_SET" -eq 0 ]]; then
-  prev="$(conf_get TUN_NAME)"
-  [[ -n "$prev" ]] && TUN_NAME="$prev"
-fi
+source "$STAGE/oxytunnel-lib.sh"
 
 while ! is_ipv4 "$LOCAL_IP"; do
-  prompt LOCAL_IP "Public IP of THIS server" "$(conf_get LOCAL_IP)"
+  prompt LOCAL_IP "Public IP of this server"
 done
 while ! is_ipv4 "$REMOTE_IP"; do
-  prompt REMOTE_IP "Public IP of the OTHER server" "$(conf_get REMOTE_IP)"
+  prompt REMOTE_IP "Public IP of the other server"
 done
 while ! is_ipv4 "$TUN_IP"; do
-  prompt TUN_IP "Tunnel IP on THIS server" "$(conf_get TUN_IP)"
+  prompt TUN_IP "Tunnel IP on this server"
 done
 while ! is_ipv4 "$PEER_IP"; do
-  prompt PEER_IP "Tunnel IP on the OTHER server" "$(conf_get PEER_IP)"
+  prompt PEER_IP "Tunnel IP on the other server"
 done
 
 [[ "$LOCAL_IP" != "$REMOTE_IP" ]] || die "The two public IPs must be different."
@@ -244,15 +262,13 @@ fi
 if [[ "$ROLE_SET" -eq 1 ]]; then
   ROLE="$(normalize_role "$ROLE")" || die "Invalid --role. Use iran or foreign."
 elif [[ -t 0 ]]; then
-  def_role="$(conf_get ROLE)"
   while true; do
-    prompt ROLE "Role of THIS server (iran/ایران forwards ports, foreign/خارج is the panel)" "$def_role"
+    prompt ROLE "Role of this server (iran or foreign)"
     if ROLE="$(normalize_role "$ROLE")"; then
       break
     fi
     echo "Enter iran or foreign."
     ROLE=""
-    def_role=""
   done
 else
   ROLE="foreign"
@@ -261,25 +277,22 @@ fi
 if [[ "$ROLE" == "iran" ]]; then
   if [[ "$PORTS_SET" -eq 1 ]]; then
     PORTS="$(parse_ports "$PORTS")" || die "Invalid --ports."
-    [[ -n "$PORTS" ]] || die "The Iran side needs at least one port. Example: --ports 8028,443"
+    [[ -n "$PORTS" ]] || die "The Iran side needs at least one port. Example: --ports 443,8443"
   elif [[ -t 0 ]]; then
-    def_ports="$(conf_get PORTS)"
     PORTS=""
     while [[ -z "$PORTS" ]]; do
-      prompt PORTS "Ports to forward to the foreign tunnel IP (example: 8028 443)" "$def_ports"
+      prompt PORTS "Ports to forward (example: 443 8443)"
       if ! PORTS="$(parse_ports "$PORTS")"; then
         echo "Use ports from 1 to 65535, separated by spaces or commas."
         PORTS=""
-        def_ports=""
         continue
       fi
       if [[ -z "$PORTS" ]]; then
         echo "Enter at least one port."
-        def_ports=""
       fi
     done
   else
-    die "Non-interactive Iran install needs --ports. Example: --ports 8028,443"
+    die "Non-interactive Iran install needs --ports. Example: --ports 443,8443"
   fi
 else
   if [[ "$PORTS_SET" -eq 1 && -n "$PORTS" ]]; then
@@ -317,7 +330,10 @@ if [[ "$ROLE" == "iran" ]]; then
   fi
 fi
 
-install -d /etc /usr/local/bin /usr/local/lib/sudotunnel
+retire_legacy
+
+install -d /etc /usr/local/bin /usr/local/lib/oxytunnel
+umask 077
 cat >"$CONF" <<EOF
 TUN_NAME="${TUN_NAME}"
 LOCAL_IP="${LOCAL_IP}"
@@ -330,31 +346,40 @@ ROLE="${ROLE}"
 PORTS="${PORTS}"
 EOF
 chmod 600 "$CONF"
+umask 022
 
-install -m 0644 "$STAGE/sudotunnel-lib.sh" /usr/local/lib/sudotunnel/lib.sh
-install -m 0755 "$STAGE/sudotunnel-up.sh" "/usr/local/bin/${APP}-up"
-install -m 0755 "$STAGE/sudotunnel-down.sh" "/usr/local/bin/${APP}-down"
-install -m 0755 "$STAGE/sudotunnel" "/usr/local/bin/${APP}"
-install -m 0644 "$STAGE/sudotunnel.service" "/etc/systemd/system/${APP}.service"
+install -m 0644 "$STAGE/oxytunnel-lib.sh" /usr/local/lib/oxytunnel/lib.sh
+install -m 0755 "$STAGE/oxytunnel-up.sh" "/usr/local/bin/${APP}-up"
+install -m 0755 "$STAGE/oxytunnel-down.sh" "/usr/local/bin/${APP}-down"
+install -m 0755 "$STAGE/oxytunnel-health.sh" "/usr/local/bin/${APP}-health"
+install -m 0755 "$STAGE/oxytunnel" "/usr/local/bin/${APP}"
+install -m 0644 "$STAGE/oxytunnel.service" "/etc/systemd/system/${APP}.service"
+install -m 0644 "$STAGE/oxytunnel-health.service" "/etc/systemd/system/${APP}-health.service"
+install -m 0644 "$STAGE/oxytunnel-health.timer" "/etc/systemd/system/${APP}-health.timer"
+touch "/var/log/${APP}.log"
+chmod 640 "/var/log/${APP}.log"
 
 systemctl daemon-reload
 systemctl enable "${APP}.service" >/dev/null
+systemctl enable oxytunnel-health.timer >/dev/null
 if ! systemctl restart "${APP}.service"; then
   journalctl -u "${APP}.service" -n 40 --no-pager >&2 || true
   die "Service failed to start."
 fi
+systemctl start oxytunnel-health.timer >/dev/null 2>&1 || echo "WARNING: health timer did not start. Check: systemctl status oxytunnel-health.timer"
 
 echo "Installed ${APP}."
 echo "Role: ${ROLE}"
 echo "Tunnel: ${TUN_IP}/${CIDR} <-> ${PEER_IP} (${TUN_NAME})"
 if [[ "$ROLE" == "iran" ]]; then
   echo "Forward: ${LOCAL_IP} ports [${PORTS}] -> ${PEER_IP}"
-  echo "Clients connect to ${LOCAL_IP}. On the foreign panel, leave Listen empty (0.0.0.0), not the Iran IP."
+  echo "Clients connect to the Iran public IP. On the foreign panel, leave Listen empty (0.0.0.0)."
 else
   echo "This side only keeps the GRE tunnel up."
-  echo "Set the same ports on the Iran server. In the panel, listen on 0.0.0.0."
+  echo "Set the ports on the Iran server. In the panel, listen on 0.0.0.0."
 fi
-echo "Check: sudotunnel status"
-echo "Change ports: sudotunnel port add <port>    sudotunnel port del <port>    sudotunnel restart"
+echo "Menu: sudo oxytunnel"
+echo "Log:  /var/log/${APP}.log"
 echo "Test: ping ${PEER_IP}"
 echo "GRE is IP protocol 47. The firewall and the provider must allow it. GRE is not encrypted."
+echo "A health timer restarts the tunnel after repeated failed checks."

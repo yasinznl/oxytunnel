@@ -1,0 +1,10 @@
+[Unit]
+Description=Check oxytunnel and restart it when the tunnel is down
+
+[Timer]
+OnBootSec=45
+OnUnitActiveSec=30
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

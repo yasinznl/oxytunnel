@@ -1,0 +1,286 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# shellcheck source=/dev/null
+source /usr/local/lib/oxytunnel/lib.sh
+
+usage() {
+  cat <<EOF
+oxytunnel — GRE tunnel, port forward, and health watch
+
+Open the management menu:
+  sudo oxytunnel
+
+Commands:
+  oxytunnel status
+  oxytunnel health
+  oxytunnel log
+  oxytunnel restart
+  oxytunnel port list
+  oxytunnel port add <port> [port...]
+  oxytunnel port del <port> [port...]
+  oxytunnel port set <port> [port...]
+  oxytunnel role iran|foreign
+
+Access: root only.
+Config: ${CONF} (mode 600)
+Log:    ${LOG_FILE} (mode 640)
+
+Port changes are stored in the config and applied by restarting the service.
+Forwarding is active only when this server's role is iran.
+On the foreign server the panel should listen on 0.0.0.0, and clients
+should connect to the Iran public IP.
+EOF
+}
+
+cmd_status() {
+  local reason
+  load_conf
+  local state="inactive"
+  if systemctl is-active --quiet "${UNIT}"; then
+    state="active"
+  fi
+  echo "role:    ${ROLE}"
+  echo "service: ${state}"
+  echo "public:  ${LOCAL_IP} -> ${REMOTE_IP}"
+  echo "tunnel:  ${TUN_IP}/${CIDR}  peer ${PEER_IP:-unset}  iface ${TUN_NAME}  mtu ${MTU}"
+  if [[ -n "${PORTS:-}" ]]; then
+    echo "ports:   ${PORTS}"
+  else
+    echo "ports:   (none)"
+  fi
+  if ip -4 -br addr show "$TUN_NAME" >/dev/null 2>&1; then
+    ip -4 -br addr show "$TUN_NAME"
+  else
+    echo "iface:   down"
+  fi
+  if reason="$(probe_tunnel)"; then
+    echo "health:  ok"
+  else
+    echo "health:  ${reason}"
+  fi
+  if [[ "$ROLE" == "iran" ]] && command -v iptables >/dev/null 2>&1; then
+    echo "dnat:"
+    ipt -t nat -S "$CHAIN_DNAT" 2>/dev/null || echo "  (no rules)"
+  fi
+  if systemctl is-active --quiet oxytunnel-health.timer; then
+    echo "watch:   timer active"
+  else
+    echo "watch:   timer inactive"
+  fi
+}
+
+require_iran() {
+  load_conf
+  [[ "$ROLE" == "iran" ]] || die "This server is '${ROLE}'. Add or remove ports on the Iran server."
+}
+
+cmd_port_list() {
+  load_conf
+  if [[ -n "${PORTS:-}" ]]; then
+    echo "$PORTS"
+  else
+    echo "(none)"
+  fi
+}
+
+cmd_port_add() {
+  local add current merged
+  [[ $# -ge 1 ]] || die "Usage: oxytunnel port add <port> [port...]"
+  require_iran
+  add="$(parse_ports "$*")" || exit 1
+  current="$(parse_ports "${PORTS:-}")" || exit 1
+  merged="$(parse_ports "$current $add")" || exit 1
+  if [[ "$merged" == "$current" ]]; then
+    echo "Ports unchanged: ${merged}"
+    return 0
+  fi
+  conf_set PORTS "$merged"
+  restart_service
+  echo "Forwarding ${merged} to ${PEER_IP}"
+}
+
+cmd_port_del() {
+  local del p kept="" removed=0
+  [[ $# -ge 1 ]] || die "Usage: oxytunnel port del <port> [port...]"
+  require_iran
+  del="$(parse_ports "$*")" || exit 1
+  for p in $PORTS; do
+    case " $del " in
+      *" $p "*) removed=1 ;;
+      *) kept="${kept:+$kept }$p" ;;
+    esac
+  done
+  if [[ "$removed" -eq 0 ]]; then
+    echo "None of those ports are in the forward list."
+    return 0
+  fi
+  conf_set PORTS "$kept"
+  restart_service
+  if [[ -n "$kept" ]]; then
+    echo "Forwarding ${kept} to ${PEER_IP}"
+  else
+    echo "No ports are forwarded. The GRE tunnel is still up."
+  fi
+}
+
+cmd_port_set() {
+  local new current
+  [[ $# -ge 1 ]] || die "Usage: oxytunnel port set <port> [port...]"
+  require_iran
+  new="$(parse_ports "$*")" || exit 1
+  [[ -n "$new" ]] || die "Give at least one port."
+  current="$(parse_ports "${PORTS:-}")" || exit 1
+  if [[ "$new" == "$current" ]]; then
+    echo "Ports unchanged: ${new}"
+    return 0
+  fi
+  conf_set PORTS "$new"
+  restart_service
+  echo "Forwarding ${new} to ${PEER_IP}"
+}
+
+cmd_role() {
+  local new
+  [[ -n "${1:-}" ]] || die "Usage: oxytunnel role iran|foreign"
+  load_conf
+  new="$(normalize_role "$1")" || die "Role must be iran or foreign."
+  if [[ "$new" == "$ROLE" ]]; then
+    echo "Role unchanged: ${ROLE}"
+    return 0
+  fi
+  if [[ "$new" == "iran" && -z "${PORTS:-}" ]]; then
+    echo "Role will be iran. After this, add ports: oxytunnel port add 443"
+  fi
+  conf_set ROLE "$new"
+  restart_service
+  echo "Role is ${new}"
+}
+
+cmd_log() {
+  local lines="${1:-40}"
+  [[ "$lines" =~ ^[0-9]+$ ]] || lines=40
+  if [[ ! -f "$LOG_FILE" ]]; then
+    echo "No log yet: ${LOG_FILE}"
+    return 0
+  fi
+  tail -n "$lines" "$LOG_FILE"
+}
+
+pause_menu() {
+  printf 'Press Enter to continue...'
+  read -r _ || true
+}
+
+cmd_menu() {
+  local choice port role
+  local -a ports=()
+  while true; do
+    echo
+    echo "oxytunnel"
+    echo "Access: root only"
+    echo "Config: ${CONF} (mode 600)"
+    echo "Log:    ${LOG_FILE} (mode 640)"
+    echo
+    echo "  1) Status"
+    echo "  2) Health check"
+    echo "  3) View log"
+    echo "  4) Add port"
+    echo "  5) Remove port"
+    echo "  6) Replace port list"
+    echo "  7) Restart tunnel"
+    echo "  8) Change role"
+    echo "  9) Exit"
+    echo
+    printf 'Select: '
+    if ! read -r choice; then
+      echo
+      break
+    fi
+    case "$choice" in
+      1) cmd_status || true; pause_menu ;;
+      2) ( watch_tunnel ) || true; echo "Health check finished."; pause_menu ;;
+      3) cmd_log 40 || true; pause_menu ;;
+      4)
+        printf 'Port to add: '
+        read -r port || true
+        if [[ -n "${port:-}" ]]; then
+          ( cmd_port_add "$port" ) || true
+        fi
+        pause_menu
+        ;;
+      5)
+        printf 'Port to remove: '
+        read -r port || true
+        if [[ -n "${port:-}" ]]; then
+          ( cmd_port_del "$port" ) || true
+        fi
+        pause_menu
+        ;;
+      6)
+        printf 'Ports (example: 443 8443): '
+        read -r -a ports || ports=()
+        if [[ ${#ports[@]} -gt 0 ]]; then
+          ( cmd_port_set "${ports[@]}" ) || true
+        fi
+        pause_menu
+        ;;
+      7)
+        ( load_conf; restart_service; echo "Restarted (${ROLE})." ) || true
+        pause_menu
+        ;;
+      8)
+        printf 'Role (iran or foreign): '
+        read -r role || true
+        if [[ -n "${role:-}" ]]; then
+          ( cmd_role "$role" ) || true
+        fi
+        pause_menu
+        ;;
+      9|q|Q|exit) break ;;
+      *) echo "Choose a number from 1 to 9." ;;
+    esac
+  done
+}
+
+main() {
+  local cmd="${1:-menu}"
+  case "$cmd" in
+    -h|--help|help) usage; exit 0 ;;
+  esac
+  require_root
+  if [[ $# -eq 0 ]]; then
+    if [[ -t 0 ]]; then
+      cmd_menu
+    else
+      cmd_status
+    fi
+    exit 0
+  fi
+  case "$cmd" in
+    menu) cmd_menu ;;
+    status) cmd_status ;;
+    health|check) watch_tunnel; echo "Health check finished." ;;
+    log|logs) shift || true; cmd_log "${1:-40}" ;;
+    restart|reload)
+      load_conf
+      restart_service
+      echo "Restarted (${ROLE})."
+      ;;
+    port|ports)
+      shift
+      local sub="${1:-list}"
+      case "$sub" in
+        list) cmd_port_list ;;
+        add) shift; cmd_port_add "$@" ;;
+        del|delete|rm|remove) shift; cmd_port_del "$@" ;;
+        set) shift; cmd_port_set "$@" ;;
+        *) usage; exit 1 ;;
+      esac
+      ;;
+    role) shift; cmd_role "${1:-}" ;;
+    *) usage; exit 1 ;;
+  esac
+}
+
+main "$@"

@@ -1,12 +1,12 @@
 [Unit]
-Description=GRE tunnel and Iran port forward (sudotunnel)
+Description=GRE tunnel and port forward (oxytunnel)
 Wants=network-online.target
 After=network-online.target netfilter-persistent.service ufw.service firewalld.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/sudotunnel-up
-ExecStop=/usr/local/bin/sudotunnel-down
+ExecStart=/usr/local/bin/oxytunnel-up
+ExecStop=/usr/local/bin/oxytunnel-down
 RemainAfterExit=yes
 
 [Install]

@@ -1,16 +1,20 @@
 #!/usr/bin/env bash
-# Shared helpers for sudotunnel. Sourced by the installer, the CLI, and systemd scripts.
+# Shared helpers for oxytunnel. Sourced by the installer, the CLI, and systemd scripts.
 
-CONF="/etc/sudotunnel.conf"
-SYSCTL_FILE="/etc/sysctl.d/99-sudotunnel.conf"
-CHAIN_DNAT="SUDOTUNNEL_DNAT"
-CHAIN_SNAT="SUDOTUNNEL_SNAT"
-CHAIN_FWD="SUDOTUNNEL_FWD"
+APP="oxytunnel"
+CONF="/etc/${APP}.conf"
+SYSCTL_FILE="/etc/sysctl.d/99-${APP}.conf"
+LOG_FILE="/var/log/${APP}.log"
+RUN_DIR="/run/${APP}"
+CHAIN_DNAT="OXYTUNNEL_DNAT"
+CHAIN_SNAT="OXYTUNNEL_SNAT"
+CHAIN_FWD="OXYTUNNEL_FWD"
+UNIT="${APP}.service"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
 require_root() {
-  [[ ${EUID:-0} -eq 0 ]] || die "Run as root."
+  [[ ${EUID:-0} -eq 0 ]] || die "Management requires root. Run: sudo ${APP}"
 }
 
 is_ipv4() {
@@ -31,8 +35,7 @@ normalize_role() {
   r="${r#"${r%%[![:space:]]*}"}"
   r="${r%"${r##*[![:space:]]}"}"
   case "$r" in
-    iran|ir|ایران) printf '%s\n' "iran" ;;
-    foreign|abroad|outside|kharej|خارج|خارجی) printf '%s\n' "foreign" ;;
+    iran|foreign) printf '%s\n' "$r" ;;
     *) return 1 ;;
   esac
 }
@@ -95,7 +98,7 @@ load_conf() {
   [[ -f "$CONF" ]] || die "Missing $CONF"
   # shellcheck disable=SC1090
   source "$CONF"
-  TUN_NAME="${TUN_NAME:-sudotunnel}"
+  TUN_NAME="${TUN_NAME:-oxytunnel}"
   CIDR="${CIDR:-30}"
   MTU="${MTU:-1476}"
   ROLE="${ROLE:-foreign}"
@@ -108,6 +111,31 @@ load_conf() {
   if ! PORTS="$(parse_ports "$PORTS")"; then
     die "Invalid PORTS in $CONF"
   fi
+}
+
+log_event() {
+  local level="$1" msg="$2" pri="user.notice" bytes=0 trimmed
+  case "$level" in
+    err|error) pri="user.err" ;;
+    warn|warning) pri="user.warning" ;;
+  esac
+  touch "$LOG_FILE" 2>/dev/null || true
+  chmod 640 "$LOG_FILE" 2>/dev/null || true
+  printf '%s %s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$level" "$msg" >>"$LOG_FILE" 2>/dev/null || true
+  if command -v logger >/dev/null 2>&1; then
+    logger -t "$APP" -p "$pri" -- "$msg" 2>/dev/null || true
+  fi
+  if [[ -f "$LOG_FILE" ]]; then
+    bytes="$(wc -c <"$LOG_FILE" | tr -d '[:space:]')"
+    if [[ "$bytes" =~ ^[0-9]+$ ]] && (( bytes > 1048576 )); then
+      trimmed="$(mktemp)"
+      tail -n 2000 "$LOG_FILE" >"$trimmed" 2>/dev/null || true
+      cat "$trimmed" >"$LOG_FILE" 2>/dev/null || true
+      rm -f "$trimmed"
+      chmod 640 "$LOG_FILE" 2>/dev/null || true
+    fi
+  fi
+  return 0
 }
 
 persist_ip_forward() {
@@ -166,7 +194,7 @@ apply_forwards() {
   command -v iptables >/dev/null 2>&1 || die "iptables is not installed. Re-run install.sh on this Iran server."
   modprobe nf_conntrack 2>/dev/null || true
   if systemctl is-active --quiet firewalld 2>/dev/null; then
-    echo "WARNING: firewalld is active and may override these port forwards." >&2
+    log_event warn "firewalld is active and may override port forwards"
   fi
   persist_ip_forward
   ensure_chain nat PREROUTING "$CHAIN_DNAT"
@@ -174,7 +202,7 @@ apply_forwards() {
   ensure_chain filter FORWARD "$CHAIN_FWD"
   if ! ipt -t filter -A "$CHAIN_FWD" -d "$PEER_IP" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT \
     || ! ipt -t filter -A "$CHAIN_FWD" -s "$PEER_IP" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT; then
-    echo "WARNING: conntrack is unavailable. Forwarded connections still work when the FORWARD policy is ACCEPT." >&2
+    log_event warn "conntrack match is unavailable; FORWARD policy must accept return traffic"
   fi
   for p in $PORTS; do
     ipt -t nat -A "$CHAIN_DNAT" -p tcp --dport "$p" -j DNAT --to-destination "${PEER_IP}:${p}"
@@ -186,6 +214,7 @@ apply_forwards() {
     ipt -t nat -A "$CHAIN_SNAT" -d "$PEER_IP" -j MASQUERADE
   fi
   save_iptables
+  log_event notice "forward rules applied for role ${ROLE} ports [${PORTS:-none}]"
 }
 
 bring_up() {
@@ -210,9 +239,108 @@ bring_down() {
 
 restart_service() {
   systemctl daemon-reload
-  systemctl enable sudotunnel.service >/dev/null
-  if ! systemctl restart sudotunnel.service; then
-    journalctl -u sudotunnel.service -n 40 --no-pager >&2 || true
-    die "sudotunnel failed to restart."
+  systemctl enable "${UNIT}" >/dev/null
+  log_event notice "restart requested"
+  if ! systemctl restart "${UNIT}"; then
+    log_event err "restart failed"
+    journalctl -u "${UNIT}" -n 40 --no-pager >&2 || true
+    die "${APP} failed to restart."
+  fi
+  log_event notice "restart finished"
+}
+
+# Print a reason and return 1 when the tunnel is not usable.
+probe_tunnel() {
+  local flags
+  if ! ip link show "$TUN_NAME" >/dev/null 2>&1; then
+    printf '%s\n' "interface ${TUN_NAME} is missing"
+    return 1
+  fi
+  flags="$(ip -o link show "$TUN_NAME" 2>/dev/null | awk '{print $3}')"
+  if [[ "$flags" != *UP* ]]; then
+    printf '%s\n' "interface ${TUN_NAME} is down"
+    return 1
+  fi
+  if ! ip -4 addr show dev "$TUN_NAME" 2>/dev/null | grep -q "inet ${TUN_IP}/"; then
+    printf '%s\n' "address ${TUN_IP} is missing on ${TUN_NAME}"
+    return 1
+  fi
+  if [[ -z "${PEER_IP:-}" ]]; then
+    printf '%s\n' "peer address is empty"
+    return 1
+  fi
+  if ! command -v ping >/dev/null 2>&1; then
+    printf '%s\n' "ok"
+    return 0
+  fi
+  if ! ping -c 2 -W 2 "$PEER_IP" >/dev/null 2>&1; then
+    printf '%s\n' "peer ${PEER_IP} did not answer"
+    return 1
+  fi
+  printf '%s\n' "ok"
+  return 0
+}
+
+watch_tunnel() {
+  local reason fails=0 now last state
+  mkdir -p "$RUN_DIR"
+  if command -v flock >/dev/null 2>&1; then
+    exec 9>"${RUN_DIR}/health.lock"
+    flock -n 9 || return 0
+  fi
+  if [[ ! -f "$CONF" ]]; then
+    log_event err "health check skipped, missing ${CONF}"
+    return 0
+  fi
+  state="$(systemctl show -p ActiveState --value "${UNIT}" 2>/dev/null || true)"
+  case "$state" in
+    activating|deactivating) return 0 ;;
+    inactive)
+      return 0
+      ;;
+    failed)
+      log_event err "service ${UNIT} is failed; restarting"
+      date +%s >"${RUN_DIR}/last-restart"
+      systemctl reset-failed "${UNIT}" >/dev/null 2>&1 || true
+      systemctl restart "${UNIT}" || log_event err "automatic restart failed"
+      return 0
+      ;;
+  esac
+  load_conf
+  if reason="$(probe_tunnel)"; then
+    if [[ -f "${RUN_DIR}/unhealthy" ]]; then
+      log_event notice "tunnel recovered on ${TUN_NAME}"
+      rm -f "${RUN_DIR}/unhealthy" "${RUN_DIR}/fails"
+    fi
+    return 0
+  fi
+  printf '%s\n' "$reason" >"${RUN_DIR}/unhealthy"
+  if [[ -f "${RUN_DIR}/fails" ]]; then
+    fails="$(tr -d '[:space:]' <"${RUN_DIR}/fails")"
+  fi
+  [[ "$fails" =~ ^[0-9]+$ ]] || fails=0
+  fails=$((fails + 1))
+  printf '%s\n' "$fails" >"${RUN_DIR}/fails"
+  log_event warn "tunnel unhealthy (${fails}): ${reason}"
+  if (( fails < 2 )); then
+    return 0
+  fi
+  now="$(date +%s)"
+  last=0
+  if [[ -f "${RUN_DIR}/last-restart" ]]; then
+    last="$(tr -d '[:space:]' <"${RUN_DIR}/last-restart")"
+  fi
+  [[ "$last" =~ ^[0-9]+$ ]] || last=0
+  if (( now - last < 90 )); then
+    log_event warn "automatic restart skipped during cooldown: ${reason}"
+    return 0
+  fi
+  log_event err "tunnel down, restarting: ${reason}"
+  printf '%s\n' "$now" >"${RUN_DIR}/last-restart"
+  printf '%s\n' "0" >"${RUN_DIR}/fails"
+  if systemctl restart "${UNIT}"; then
+    log_event notice "automatic restart finished"
+  else
+    log_event err "automatic restart failed: ${reason}"
   fi
 }
