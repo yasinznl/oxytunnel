@@ -12,6 +12,8 @@ Open the management menu:
   sudo oxytunnel
 
 Commands:
+  oxytunnel
+  oxytunnel setup
   oxytunnel status
   oxytunnel health
   oxytunnel log
@@ -167,78 +169,218 @@ cmd_log() {
   tail -n "$lines" "$LOG_FILE"
 }
 
+if [[ -t 1 ]]; then
+  C_RESET=$'\033[0m'
+  C_BOLD=$'\033[1m'
+  C_DIM=$'\033[2m'
+  C_RED=$'\033[31m'
+  C_GREEN=$'\033[32m'
+  C_CYAN=$'\033[36m'
+  C_YELLOW=$'\033[33m'
+else
+  C_RESET=""
+  C_BOLD=""
+  C_DIM=""
+  C_RED=""
+  C_GREEN=""
+  C_CYAN=""
+  C_YELLOW=""
+fi
+
+ui_rule() {
+  printf '%b\n' "${C_CYAN}------------------------------------------------------------------${C_RESET}"
+}
+
 pause_menu() {
-  printf 'Press Enter to continue...'
+  echo
+  printf '%b' "${C_DIM}  Press Enter to continue...${C_RESET}"
   read -r _ || true
 }
 
-cmd_menu() {
-  local choice port role
+menu_banner() {
+  local name="none" role="-" state="absent" tone="$C_DIM"
+  printf '\033[H\033[2J' 2>/dev/null || true
+  ui_rule
+  printf '%b\n' "${C_BOLD}${C_CYAN}  OXYTUNNEL${C_RESET}  ${C_DIM}GRE tunnel manager${C_RESET}"
+  ui_rule
+  if [[ -f "$CONF" ]]; then
+    load_conf
+    name="$TUN_NAME"
+    role="$ROLE"
+    if ! ip link show "$TUN_NAME" >/dev/null 2>&1; then
+      state="down"
+      tone="$C_RED"
+    elif systemctl is-active --quiet "$UNIT"; then
+      state="running"
+      tone="$C_GREEN"
+    else
+      state="stopped"
+      tone="$C_YELLOW"
+    fi
+  fi
+  printf '  %-12s %s\n' "Tunnel" "$name"
+  printf '  %-12s %s\n' "Role" "$role"
+  printf '  %-12s %b%s%b\n' "State" "$tone" "$state" "$C_RESET"
+  ui_rule
+}
+
+cmd_new_tunnel() {
+  local answer=""
+  if [[ -f "$CONF" ]]; then
+    printf '%b' "${C_YELLOW}  Replace the current tunnel? [y/N]:${C_RESET} "
+    read -r answer || true
+    [[ "${answer:-}" =~ ^[Yy]$ ]] || { echo "  Cancelled."; return 0; }
+  fi
+  ROLE=""
+  ROLE_SET=0
+  PORTS_SET=0
+  LOCAL_IP=""
+  REMOTE_IP=""
+  TUN_IP=""
+  PEER_IP=""
+  PORTS=""
+  CIDR="30"
+  MTU="1476"
+  TUN_NAME="oxytunnel"
+  collect_tunnel_answers
+  assert_tunnel_settings
+  ensure_iran_packages
+  write_tunnel_conf
+  systemctl daemon-reload
+  systemctl enable "${UNIT}" >/dev/null
+  systemctl enable oxytunnel-health.timer >/dev/null
+  restart_service
+  systemctl start oxytunnel-health.timer >/dev/null 2>&1 || true
+  log_event notice "tunnel configuration saved from menu"
+  echo "  Tunnel saved and restarted."
+}
+
+cmd_tunnels() {
+  local state="down"
+  echo
+  printf '%b\n' "${C_BOLD}  Tunnels${C_RESET}"
+  ui_rule
+  if [[ ! -f "$CONF" ]]; then
+    echo "  No tunnel is configured."
+    echo "  Choose New tunnel to create one."
+    ui_rule
+    return 0
+  fi
+  load_conf
+  if systemctl is-active --quiet "$UNIT" && ip link show "$TUN_NAME" >/dev/null 2>&1; then
+    state="up"
+  fi
+  printf '  %-14s %-10s %-8s %s\n' "NAME" "ROLE" "STATE" "PUBLIC"
+  printf '  %-14s %-10s %-8s %s\n' "$TUN_NAME" "$ROLE" "$state" "${LOCAL_IP} -> ${REMOTE_IP}"
+  printf '  %-14s %s\n' "TUNNEL" "${TUN_IP}/${CIDR} -> ${PEER_IP}"
+  if [[ -n "${PORTS:-}" ]]; then
+    printf '  %-14s %s\n' "PORTS" "$PORTS"
+  else
+    printf '  %-14s %s\n' "PORTS" "none"
+  fi
+  ui_rule
+  echo "  This host runs one GRE tunnel."
+}
+
+cmd_stop() {
+  if [[ ! -f "$CONF" ]]; then
+    echo "  No tunnel is configured."
+    return 0
+  fi
+  systemctl stop "$UNIT"
+  log_event notice "tunnel stopped from the menu"
+  echo "  Tunnel stopped."
+  echo "  The health timer will leave it stopped until you restart it."
+}
+
+cmd_ports_menu() {
+  local choice="" port=""
   local -a ports=()
   while true; do
     echo
-    echo "oxytunnel"
-    echo "Access: root only"
-    echo "Config: ${CONF} (mode 600)"
-    echo "Log:    ${LOG_FILE} (mode 640)"
-    echo
-    echo "  1) Status"
-    echo "  2) Health check"
-    echo "  3) View log"
-    echo "  4) Add port"
-    echo "  5) Remove port"
-    echo "  6) Replace port list"
-    echo "  7) Restart tunnel"
-    echo "  8) Change role"
-    echo "  9) Exit"
-    echo
-    printf 'Select: '
+    printf '%b\n' "${C_BOLD}  Ports${C_RESET}"
+    echo "  1   List"
+    echo "  2   Add"
+    echo "  3   Remove"
+    echo "  4   Replace list"
+    echo "  0   Back"
+    printf '%b' "${C_CYAN}  Select:${C_RESET} "
+    read -r choice || return 0
+    case "$choice" in
+      1) cmd_port_list || true ;;
+      2)
+        printf '  Port to add: '
+        read -r port || true
+        if [[ -n "${port:-}" ]]; then
+          ( cmd_port_add "$port" ) || true
+        fi
+        ;;
+      3)
+        printf '  Port to remove: '
+        read -r port || true
+        if [[ -n "${port:-}" ]]; then
+          ( cmd_port_del "$port" ) || true
+        fi
+        ;;
+      4)
+        printf '  Ports (example: 443 8443): '
+        read -r -a ports || ports=()
+        if [[ ${#ports[@]} -gt 0 ]]; then
+          ( cmd_port_set "${ports[@]}" ) || true
+        fi
+        ;;
+      0|back) return 0 ;;
+      *) echo "  Choose 0, 1, 2, 3, or 4." ;;
+    esac
+  done
+}
+
+cmd_menu() {
+  local choice="" role=""
+  while true; do
+    menu_banner
+    echo "  1   Status"
+    echo "  2   New tunnel"
+    echo "  3   Tunnels"
+    echo "  4   Logs"
+    echo "  5   Restart tunnel"
+    echo "  6   Stop tunnel"
+    echo "  7   Health check"
+    echo "  8   Ports"
+    echo "  9   Change role"
+    echo "  0   Exit"
+    ui_rule
+    printf '%b' "${C_DIM}  root only${C_RESET}  ${C_CYAN}Select an option:${C_RESET} "
     if ! read -r choice; then
       echo
       break
     fi
     case "$choice" in
       1) cmd_status || true; pause_menu ;;
-      2) ( watch_tunnel ) || true; echo "Health check finished."; pause_menu ;;
-      3) cmd_log 40 || true; pause_menu ;;
-      4)
-        printf 'Port to add: '
-        read -r port || true
-        if [[ -n "${port:-}" ]]; then
-          ( cmd_port_add "$port" ) || true
-        fi
-        pause_menu
-        ;;
+      2) ( cmd_new_tunnel ) || true; pause_menu ;;
+      3) cmd_tunnels || true; pause_menu ;;
+      4) echo; cmd_log 40 || true; pause_menu ;;
       5)
-        printf 'Port to remove: '
-        read -r port || true
-        if [[ -n "${port:-}" ]]; then
-          ( cmd_port_del "$port" ) || true
+        if [[ -f "$CONF" ]]; then
+          ( load_conf; restart_service; echo "  Tunnel restarted." ) || true
+        else
+          echo "  No tunnel is configured."
         fi
         pause_menu
         ;;
-      6)
-        printf 'Ports (example: 443 8443): '
-        read -r -a ports || ports=()
-        if [[ ${#ports[@]} -gt 0 ]]; then
-          ( cmd_port_set "${ports[@]}" ) || true
-        fi
-        pause_menu
-        ;;
-      7)
-        ( load_conf; restart_service; echo "Restarted (${ROLE})." ) || true
-        pause_menu
-        ;;
-      8)
-        printf 'Role (iran or foreign): '
+      6) cmd_stop || true; pause_menu ;;
+      7) ( watch_tunnel ) || true; echo "  Health check finished."; pause_menu ;;
+      8) cmd_ports_menu || true ;;
+      9)
+        printf '  Role (iran or foreign): '
         read -r role || true
         if [[ -n "${role:-}" ]]; then
           ( cmd_role "$role" ) || true
         fi
         pause_menu
         ;;
-      9|q|Q|exit) break ;;
-      *) echo "Choose a number from 1 to 9." ;;
+      0|q|Q|exit) break ;;
+      *) echo "  Choose an option from the list."; pause_menu ;;
     esac
   done
 }
@@ -259,6 +401,9 @@ main() {
   fi
   case "$cmd" in
     menu) cmd_menu ;;
+    setup|new) cmd_new_tunnel ;;
+    tunnels) cmd_tunnels ;;
+    stop) cmd_stop ;;
     status) cmd_status ;;
     health|check) watch_tunnel; echo "Health check finished." ;;
     log|logs) shift || true; cmd_log "${1:-40}" ;;

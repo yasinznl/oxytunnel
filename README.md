@@ -13,10 +13,12 @@ curl -fsSL -o install.sh https://raw.githubusercontent.com/yasinznl/oxytunnel/ma
 sudo bash install.sh
 ```
 
-It asks for the public IPs, the tunnel IPs, and the role of this machine:
+The first question is the role of this machine. The public IP of this server is filled in when it can be detected; press Enter to keep it.
 
 - `iran` — forward the ports you enter to the foreign tunnel IP
 - `foreign` — bring up GRE only
+
+When the installer is running in a terminal, it opens the management menu after the tunnel is up.
 
 Use the same pair of tunnel addresses on both sides. `/31` is the simplest point-to-point prefix. `/30` also works; do not use the network or broadcast address.
 
@@ -55,7 +57,7 @@ Management is root-only. One command opens the menu:
 sudo oxytunnel
 ```
 
-The menu shows status, runs a health check, prints the log, adds or removes ports, restarts the tunnel, and changes the role. The same actions exist as commands:
+The menu lists status, new tunnel, tunnels, logs, restart, stop, health check, ports, and role. The same actions exist as commands:
 
 ```bash
 sudo oxytunnel status

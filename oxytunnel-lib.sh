@@ -344,3 +344,223 @@ watch_tunnel() {
     log_event err "automatic restart failed: ${reason}"
   fi
 }
+
+ask_line() {
+  local var="$1" msg="$2" def="${3:-}" val=""
+  if [[ -n "$def" ]]; then
+    read -r -p "$msg [$def]: " val || die "Input closed before the answer was given."
+    val="${val:-$def}"
+  else
+    read -r -p "$msg: " val || die "Input closed before the answer was given."
+  fi
+  printf -v "$var" '%s' "$val"
+}
+
+detect_local_ip() {
+  local ip=""
+  ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')"
+  if ! is_ipv4 "${ip:-}"; then
+    if command -v curl >/dev/null 2>&1; then
+      ip="$(curl -4 -fsSL --max-time 4 https://api.ipify.org 2>/dev/null || true)"
+      ip="${ip//$'\r'/}"
+      ip="${ip//$'\n'/}"
+    fi
+  fi
+  if is_ipv4 "${ip:-}"; then
+    printf '%s\n' "$ip"
+    return 0
+  fi
+  return 1
+}
+
+ip_to_int() {
+  local a b c d
+  IFS='.' read -r a b c d <<<"$1"
+  echo $(( (10#$a << 24) + (10#$b << 16) + (10#$c << 8) + 10#$d ))
+}
+
+int_to_ip() {
+  local n="$1"
+  echo "$(( (n >> 24) & 255 )).$(( (n >> 16) & 255 )).$(( (n >> 8) & 255 )).$(( n & 255 ))"
+}
+
+assert_tunnel_settings() {
+  local mask net_tun net_peer tun_i net_i bcast_i net_ip bcast_ip
+  [[ "${LOCAL_IP:-}" != "${REMOTE_IP:-}" ]] || die "The two public IPs must be different."
+  [[ "${TUN_IP:-}" != "${PEER_IP:-}" ]] || die "The two tunnel IPs must be different."
+  is_ipv4 "${LOCAL_IP:-}" || die "Local public IP is invalid."
+  is_ipv4 "${REMOTE_IP:-}" || die "Remote public IP is invalid."
+  is_ipv4 "${TUN_IP:-}" || die "Tunnel IP is invalid."
+  is_ipv4 "${PEER_IP:-}" || die "Peer tunnel IP is invalid."
+  CIDR="${CIDR:-30}"
+  MTU="${MTU:-1476}"
+  TUN_NAME="${TUN_NAME:-oxytunnel}"
+  [[ "$CIDR" =~ ^[0-9]+$ ]] || die "Invalid CIDR."
+  CIDR=$((10#$CIDR))
+  (( CIDR >= 1 && CIDR <= 32 )) || die "CIDR must be between 1 and 32."
+  [[ "$MTU" =~ ^[0-9]+$ ]] || die "Invalid MTU."
+  MTU=$((10#$MTU))
+  (( MTU >= 576 && MTU <= 9000 )) || die "MTU must be between 576 and 9000."
+  [[ "$TUN_NAME" =~ ^[A-Za-z0-9._:-]{1,15}$ ]] || die "Invalid interface name."
+  ROLE="$(normalize_role "${ROLE:-}")" || die "Role must be iran or foreign."
+  if [[ "$ROLE" == "iran" ]]; then
+    PORTS="$(parse_ports "${PORTS:-}")" || die "Invalid port list."
+    [[ -n "$PORTS" ]] || die "The Iran side needs at least one port."
+  else
+    PORTS=""
+  fi
+  if (( CIDR <= 31 )); then
+    mask=$(( (0xFFFFFFFF << (32 - CIDR)) & 0xFFFFFFFF ))
+    net_tun=$(( $(ip_to_int "$TUN_IP") & mask ))
+    net_peer=$(( $(ip_to_int "$PEER_IP") & mask ))
+    [[ "$net_tun" -eq "$net_peer" ]] || die "Tunnel IP and peer IP are not in the same /${CIDR} network."
+  fi
+  if [[ "$CIDR" == "30" ]]; then
+    tun_i="$(ip_to_int "$TUN_IP")"
+    net_i=$(( tun_i & 0xFFFFFFFC ))
+    bcast_i=$(( net_i + 3 ))
+    net_ip="$(int_to_ip "$net_i")"
+    bcast_ip="$(int_to_ip "$bcast_i")"
+    [[ "$TUN_IP" != "$net_ip" && "$TUN_IP" != "$bcast_ip" ]] || die "For /30, the tunnel IP cannot be the network or broadcast address."
+    [[ "$PEER_IP" != "$net_ip" && "$PEER_IP" != "$bcast_ip" ]] || die "For /30, the peer IP cannot be the network or broadcast address."
+  fi
+}
+
+write_tunnel_conf() {
+  local old_umask
+  old_umask="$(umask)"
+  umask 077
+  cat >"$CONF" <<EOF
+TUN_NAME="${TUN_NAME}"
+LOCAL_IP="${LOCAL_IP}"
+REMOTE_IP="${REMOTE_IP}"
+TUN_IP="${TUN_IP}"
+PEER_IP="${PEER_IP}"
+CIDR="${CIDR}"
+MTU="${MTU}"
+ROLE="${ROLE}"
+PORTS="${PORTS}"
+EOF
+  chmod 600 "$CONF"
+  umask "$old_umask"
+}
+
+ensure_iran_packages() {
+  [[ "${ROLE:-}" == "iran" ]] || return 0
+  if ! command -v iptables >/dev/null 2>&1 || { command -v apt-get >/dev/null 2>&1 && ! dpkg -s iptables-persistent >/dev/null 2>&1; }; then
+    if command -v apt-get >/dev/null 2>&1; then
+      DEBIAN_FRONTEND=noninteractive apt-get update
+    fi
+  fi
+  if ! command -v iptables >/dev/null 2>&1; then
+    if command -v apt-get >/dev/null 2>&1; then
+      DEBIAN_FRONTEND=noninteractive apt-get install -y iptables
+    elif command -v dnf >/dev/null 2>&1; then
+      dnf install -y iptables
+    elif command -v yum >/dev/null 2>&1; then
+      yum install -y iptables
+    elif command -v apk >/dev/null 2>&1; then
+      apk add --no-cache iptables
+    else
+      die "iptables is missing and no supported package manager was found."
+    fi
+  fi
+  command -v iptables >/dev/null 2>&1 || die "iptables installation failed."
+  if command -v apt-get >/dev/null 2>&1 && ! dpkg -s iptables-persistent >/dev/null 2>&1; then
+    if command -v debconf-set-selections >/dev/null 2>&1; then
+      echo "iptables-persistent iptables-persistent/autosave_v4 boolean true" | debconf-set-selections
+      echo "iptables-persistent iptables-persistent/autosave_v6 boolean true" | debconf-set-selections
+    fi
+    DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent || true
+  fi
+}
+
+collect_tunnel_answers() {
+  local detected=""
+  local show_header=0
+  CIDR="${CIDR:-30}"
+  MTU="${MTU:-1476}"
+  TUN_NAME="${TUN_NAME:-oxytunnel}"
+  if [[ -t 0 ]]; then
+    if [[ "${ROLE_SET:-0}" -eq 0 && -z "${ROLE:-}" ]]; then show_header=1; fi
+    if ! is_ipv4 "${LOCAL_IP:-}"; then show_header=1; fi
+    if ! is_ipv4 "${REMOTE_IP:-}"; then show_header=1; fi
+    if ! is_ipv4 "${TUN_IP:-}"; then show_header=1; fi
+    if ! is_ipv4 "${PEER_IP:-}"; then show_header=1; fi
+    if [[ "$show_header" -eq 1 ]]; then
+      echo
+      echo "Oxytunnel setup"
+      echo "Choose iran or foreign first. Press Enter to accept a value shown in brackets."
+      echo
+    fi
+  fi
+  if [[ "${ROLE_SET:-0}" -eq 1 || -n "${ROLE:-}" ]]; then
+    ROLE="$(normalize_role "${ROLE:-}")" || die "Invalid role. Use iran or foreign."
+  elif [[ -t 0 ]]; then
+    while true; do
+      ask_line ROLE "Role of this server (iran or foreign)"
+      if ROLE="$(normalize_role "$ROLE")"; then
+        break
+      fi
+      echo "Enter iran or foreign."
+      ROLE=""
+    done
+  else
+    ROLE="foreign"
+  fi
+  detected="$(detect_local_ip || true)"
+  while ! is_ipv4 "${LOCAL_IP:-}"; do
+    if [[ -t 0 ]]; then
+      ask_line LOCAL_IP "Public IP of this server" "$detected"
+    else
+      die "Missing --local-ip."
+    fi
+  done
+  while ! is_ipv4 "${REMOTE_IP:-}"; do
+    if [[ -t 0 ]]; then
+      ask_line REMOTE_IP "Public IP of the other server"
+    else
+      die "Missing --remote-ip."
+    fi
+  done
+  while ! is_ipv4 "${TUN_IP:-}"; do
+    if [[ -t 0 ]]; then
+      ask_line TUN_IP "Tunnel IP on this server"
+    else
+      die "Missing --tun-ip."
+    fi
+  done
+  while ! is_ipv4 "${PEER_IP:-}"; do
+    if [[ -t 0 ]]; then
+      ask_line PEER_IP "Tunnel IP on the other server"
+    else
+      die "Missing --peer-ip."
+    fi
+  done
+  if [[ "$ROLE" == "iran" ]]; then
+    if [[ "${PORTS_SET:-0}" -eq 1 ]]; then
+      PORTS="$(parse_ports "${PORTS:-}")" || die "Invalid --ports."
+      [[ -n "$PORTS" ]] || die "The Iran side needs at least one port. Example: --ports 443,8443"
+    elif [[ -t 0 ]]; then
+      PORTS=""
+      while [[ -z "$PORTS" ]]; do
+        ask_line PORTS "Ports to forward (example: 443 8443)"
+        if ! PORTS="$(parse_ports "$PORTS")"; then
+          echo "Use ports from 1 to 65535, separated by spaces or commas."
+          PORTS=""
+          continue
+        fi
+        if [[ -z "$PORTS" ]]; then
+          echo "Enter at least one port."
+        fi
+      done
+    else
+      die "Non-interactive Iran install needs --ports. Example: --ports 443,8443"
+    fi
+  else
+    if [[ "${PORTS_SET:-0}" -eq 1 && -n "${PORTS:-}" ]]; then
+      echo "Ports are forwarded only on the Iran server. Ignoring --ports here."
+    fi
+    PORTS=""
+  fi
+}
