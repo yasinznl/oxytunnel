@@ -42,6 +42,11 @@ cmd_status() {
   if systemctl is-active --quiet "${UNIT}"; then
     state="active"
   fi
+  if [[ "${PROTO:-gre4}" == "gre6" ]]; then
+    echo "type:    gre6 (experimental)"
+  else
+    echo "type:    gre4"
+  fi
   echo "role:    ${ROLE}"
   echo "speed:   ${SPEED}"
   echo "service: ${state}"
@@ -226,11 +231,29 @@ menu_banner() {
 }
 
 cmd_new_tunnel() {
-  local answer=""
+  local answer="" kind="" old_proto=""
   if [[ -f "$CONF" ]]; then
     printf '%b' "${C_YELLOW}  Replace the current tunnel? [y/N]:${C_RESET} "
     read -r answer || true
     [[ "${answer:-}" =~ ^[Yy]$ ]] || { echo "  Cancelled."; return 0; }
+    old_proto="$(conf_get PROTO)"
+  fi
+  echo
+  echo "  gre4   IPv4 GRE. This is the current tunnel."
+  echo "  gre6   IPv6 GRE. Experimental."
+  echo
+  while true; do
+    ask_line kind "Tunnel type (gre4 or gre6)" "gre4"
+    if kind="$(normalize_proto "$kind")"; then
+      break
+    fi
+    echo "  Enter gre4 or gre6."
+    kind=""
+  done
+  if [[ "$kind" == "gre6" ]]; then
+    echo "  GRE v6 is experimental."
+    cmd_new_tunnel_v6
+    return
   fi
   ROLE=""
   ROLE_SET=0
@@ -249,6 +272,10 @@ cmd_new_tunnel() {
   assert_tunnel_settings
   ensure_iran_packages
   write_tunnel_conf
+  if [[ "$old_proto" == "gre6" ]]; then
+    ip -6 tunnel del "$TUN_NAME" >/dev/null 2>&1 || true
+    ip link del "$TUN_NAME" >/dev/null 2>&1 || true
+  fi
   systemctl daemon-reload
   systemctl enable "${UNIT}" >/dev/null
   systemctl enable oxytunnel-health.timer >/dev/null
@@ -256,6 +283,33 @@ cmd_new_tunnel() {
   systemctl start oxytunnel-health.timer >/dev/null 2>&1 || true
   log_event notice "tunnel configuration saved from menu"
   echo "  Tunnel saved and restarted."
+}
+
+cmd_new_tunnel_v6() {
+  ROLE=""
+  ROLE_SET=0
+  PORTS_SET=0
+  LOCAL_IP=""
+  REMOTE_IP=""
+  TUN_IP=""
+  PEER_IP=""
+  PORTS=""
+  SPEED=""
+  SPEED_SET=0
+  CIDR="30"
+  MTU="1456"
+  TUN_NAME="oxytunnel"
+  collect_tunnel_answers_v6
+  assert_tunnel_settings_v6
+  ensure_iran_packages
+  write_tunnel_conf_v6
+  systemctl daemon-reload
+  systemctl enable "${UNIT}" >/dev/null
+  systemctl enable oxytunnel-health.timer >/dev/null
+  restart_service
+  systemctl start oxytunnel-health.timer >/dev/null 2>&1 || true
+  log_event notice "experimental GRE v6 configuration saved from menu"
+  echo "  Experimental GRE v6 tunnel saved and restarted."
 }
 
 cmd_start() {
@@ -284,6 +338,11 @@ cmd_health() {
     return 0
   fi
   load_conf
+  if [[ "${PROTO:-gre4}" == "gre6" ]]; then
+    printf '  %-14s %s\n' "Type" "gre6 experimental"
+  else
+    printf '  %-14s %s\n' "Type" "gre4"
+  fi
   svc="$(systemctl is-active "$UNIT" 2>/dev/null || true)"
   [[ -n "$svc" ]] || svc="unknown"
   printf '  %-14s %s\n' "Service" "$svc"
@@ -346,6 +405,10 @@ cmd_edit_tunnel() {
   local d_role="" d_local="" d_remote="" d_tun="" d_peer="" d_ports="" d_speed=""
   [[ -f "$CONF" ]] || { echo "  No tunnel is configured."; return 0; }
   load_conf
+  if [[ "${PROTO:-gre4}" == "gre6" ]]; then
+    cmd_edit_tunnel_v6
+    return
+  fi
   d_role="$ROLE"
   d_local="$LOCAL_IP"
   d_remote="$REMOTE_IP"
@@ -413,6 +476,82 @@ cmd_edit_tunnel() {
   restart_service
   log_event notice "tunnel edited from the menu"
   echo "  Tunnel updated and restarted."
+}
+
+cmd_edit_tunnel_v6() {
+  local d_role="" d_local="" d_remote="" d_tun="" d_peer="" d_ports="" d_speed=""
+  load_conf
+  d_role="$ROLE"
+  d_local="$LOCAL_IP"
+  d_remote="$REMOTE_IP"
+  d_tun="$TUN_IP"
+  d_peer="$PEER_IP"
+  d_ports="$PORTS"
+  d_speed="${SPEED:-normal}"
+  ROLE=""
+  LOCAL_IP=""
+  REMOTE_IP=""
+  TUN_IP=""
+  PEER_IP=""
+  PORTS=""
+  SPEED=""
+  echo
+  echo "  Edit GRE v6. This mode is experimental."
+  echo "  Press Enter to keep the current value."
+  echo "  normal is the standard tunnel. fast uses the full link."
+  echo "  Set the same speed on both servers."
+  echo
+  while true; do
+    ask_line ROLE "Role of this server (iran or foreign)" "$d_role"
+    if ROLE="$(normalize_role "$ROLE")"; then
+      break
+    fi
+    echo "  Enter iran or foreign."
+    ROLE=""
+  done
+  while true; do
+    ask_line SPEED "Speed (normal or fast)" "$d_speed"
+    if SPEED="$(normalize_speed "$SPEED")"; then
+      break
+    fi
+    echo "  Enter normal or fast."
+    SPEED=""
+  done
+  while ! is_global_ipv6 "${LOCAL_IP:-}"; do
+    ask_line LOCAL_IP "Public IPv6 of this server" "$d_local"
+  done
+  while ! is_global_ipv6 "${REMOTE_IP:-}"; do
+    ask_line REMOTE_IP "Public IPv6 of the other server" "$d_remote"
+  done
+  while ! is_ipv4 "${TUN_IP:-}"; do
+    ask_line TUN_IP "Tunnel IP on this server" "$d_tun"
+  done
+  while ! is_ipv4 "${PEER_IP:-}"; do
+    ask_line PEER_IP "Tunnel IP on the other server" "$d_peer"
+  done
+  if [[ "$ROLE" == "iran" ]]; then
+    while [[ -z "$PORTS" ]]; do
+      ask_line PORTS "Ports to forward (example: 443 8443)" "$d_ports"
+      if ! PORTS="$(parse_ports "$PORTS")"; then
+        echo "  Use ports from 1 to 65535, separated by spaces or commas."
+        PORTS=""
+        d_ports=""
+        continue
+      fi
+      [[ -n "$PORTS" ]] || echo "  Enter at least one port."
+    done
+  else
+    PORTS=""
+  fi
+  CIDR="${CIDR:-30}"
+  MTU="${MTU:-1456}"
+  TUN_NAME="${TUN_NAME:-oxytunnel}"
+  assert_tunnel_settings_v6
+  ensure_iran_packages
+  write_tunnel_conf_v6
+  restart_service
+  log_event notice "experimental GRE v6 edited from the menu"
+  echo "  Experimental GRE v6 tunnel updated and restarted."
 }
 
 cmd_delete_tunnel() {
@@ -603,6 +742,11 @@ cmd_tunnels() {
     printf '  %-14s %-10s %-8s %s\n' "NAME" "ROLE" "STATE" "PUBLIC"
     printf '  %-14s %-10s %-8s %s\n' "$TUN_NAME" "$ROLE" "$state" "${LOCAL_IP} -> ${REMOTE_IP}"
     printf '  %-14s %s\n' "TUNNEL" "${TUN_IP}/${CIDR} -> ${PEER_IP}"
+    if [[ "${PROTO:-gre4}" == "gre6" ]]; then
+      printf '  %-14s %s\n' "TYPE" "gre6 experimental"
+    else
+      printf '  %-14s %s\n' "TYPE" "gre4"
+    fi
     printf '  %-14s %s\n' "SPEED" "$SPEED"
     if [[ -n "${PORTS:-}" ]]; then
       printf '  %-14s %s\n' "PORTS" "$PORTS"

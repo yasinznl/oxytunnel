@@ -276,7 +276,7 @@ if [[ "$REFRESH" -eq 1 ]]; then
   echo "Open Tunnels, then Edit tunnel, and set Speed to fast or normal."
 else
   echo "Installation complete."
-  echo "Choose New tunnel in the menu. The first question is iran or foreign."
+  echo "Choose New tunnel in the menu. Choose gre4 for the current tunnel. gre6 is experimental."
 fi
 if [[ -t 0 && -t 1 ]]; then
   trap - EXIT

@@ -110,8 +110,10 @@ conf_set() {
 
 load_conf() {
   [[ -f "$CONF" ]] || die "Missing $CONF"
+  PROTO="gre4"
   # shellcheck disable=SC1090
   source "$CONF"
+  PROTO="${PROTO:-gre4}"
   TUN_NAME="${TUN_NAME:-oxytunnel}"
   CIDR="${CIDR:-30}"
   MTU="${MTU:-1476}"
@@ -711,5 +713,265 @@ collect_tunnel_answers() {
     done
   else
     SPEED="normal"
+  fi
+}
+
+normalize_proto() {
+  local p
+  p="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')"
+  p="${p// /}"
+  case "$p" in
+    gre4|grev4|v4|ipv4|4) printf '%s\n' "gre4" ;;
+    gre6|grev6|v6|ipv6|6) printf '%s\n' "gre6" ;;
+    *) return 1 ;;
+  esac
+}
+
+is_ipv6() {
+  local ip="${1:-}" left right g
+  local -a groups=()
+  [[ -n "$ip" ]] || return 1
+  [[ "$ip" != *%* && "$ip" != *.* && "$ip" != *" "* ]] || return 1
+  [[ "$ip" =~ ^[0-9A-Fa-f:]+$ ]] || return 1
+  [[ "$ip" == *:* ]] || return 1
+  case "$ip" in
+    *::*::*) return 1 ;;
+  esac
+  if [[ "$ip" == *"::"* ]]; then
+    left="${ip%%::*}"
+    right="${ip#*::}"
+    [[ "$left" != *::* && "$right" != *::* ]] || return 1
+    groups=()
+    if [[ -n "$left" ]]; then
+      IFS=':' read -r -a groups <<< "$left"
+      for g in "${groups[@]}"; do
+        [[ "$g" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+      done
+      left="${#groups[@]}"
+    else
+      left=0
+    fi
+    groups=()
+    if [[ -n "$right" ]]; then
+      IFS=':' read -r -a groups <<< "$right"
+      for g in "${groups[@]}"; do
+        [[ "$g" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+      done
+      right="${#groups[@]}"
+    else
+      right=0
+    fi
+    (( left + right < 8 )) || return 1
+    return 0
+  fi
+  IFS=':' read -r -a groups <<< "$ip"
+  [[ "${#groups[@]}" -eq 8 ]] || return 1
+  for g in "${groups[@]}"; do
+    [[ "$g" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+  done
+  return 0
+}
+
+is_global_ipv6() {
+  local low
+  is_ipv6 "${1:-}" || return 1
+  low="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  [[ "$low" == "::" || "$low" == "::1" ]] && return 1
+  [[ "$low" == fe[89ab]*:* ]] && return 1
+  [[ "$low" == ff*:* ]] && return 1
+  return 0
+}
+
+detect_local_ipv6() {
+  local ip=""
+  ip="$(ip -6 route get 2001:4860:4860::8888 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}' || true)"
+  if is_global_ipv6 "${ip:-}"; then
+    printf '%s\n' "$ip"
+    return 0
+  fi
+  ip="$(ip -6 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n 1 || true)"
+  if is_global_ipv6 "${ip:-}"; then
+    printf '%s\n' "$ip"
+    return 0
+  fi
+  return 1
+}
+
+assert_tunnel_settings_v6() {
+  local mask net_tun net_peer tun_i net_i bcast_i net_ip bcast_ip disabled
+  is_global_ipv6 "${LOCAL_IP:-}" || die "Local public IPv6 is invalid. Use a global address, not a link-local address."
+  is_global_ipv6 "${REMOTE_IP:-}" || die "Remote public IPv6 is invalid. Use a global address, not a link-local address."
+  [[ "${LOCAL_IP:-}" != "${REMOTE_IP:-}" ]] || die "The two public IPv6 addresses must be different."
+  [[ "${TUN_IP:-}" != "${PEER_IP:-}" ]] || die "The two tunnel IPs must be different."
+  is_ipv4 "${TUN_IP:-}" || die "Tunnel IP is invalid."
+  is_ipv4 "${PEER_IP:-}" || die "Peer tunnel IP is invalid."
+  CIDR="${CIDR:-30}"
+  MTU="${MTU:-1456}"
+  TUN_NAME="${TUN_NAME:-oxytunnel}"
+  [[ "$CIDR" =~ ^[0-9]+$ ]] || die "Invalid CIDR."
+  CIDR=$((10#$CIDR))
+  (( CIDR >= 1 && CIDR <= 32 )) || die "CIDR must be between 1 and 32."
+  [[ "$MTU" =~ ^[0-9]+$ ]] || die "Invalid MTU."
+  MTU=$((10#$MTU))
+  (( MTU >= 1280 && MTU <= 9000 )) || die "GRE v6 MTU must be between 1280 and 9000."
+  [[ "$TUN_NAME" =~ ^[A-Za-z0-9._:-]{1,15}$ ]] || die "Invalid interface name."
+  ROLE="$(normalize_role "${ROLE:-}")" || die "Role must be iran or foreign."
+  SPEED="$(normalize_speed "${SPEED:-normal}")" || die "Speed must be normal or fast."
+  disabled="$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo 0)"
+  [[ "$disabled" == "0" ]] || die "IPv6 is disabled on this server."
+  if [[ "$ROLE" == "iran" ]]; then
+    PORTS="$(parse_ports "${PORTS:-}")" || die "Invalid port list."
+    [[ -n "$PORTS" ]] || die "The Iran side needs at least one port."
+  else
+    PORTS=""
+  fi
+  if (( CIDR <= 31 )); then
+    mask=$(( (0xFFFFFFFF << (32 - CIDR)) & 0xFFFFFFFF ))
+    net_tun=$(( $(ip_to_int "$TUN_IP") & mask ))
+    net_peer=$(( $(ip_to_int "$PEER_IP") & mask ))
+    [[ "$net_tun" -eq "$net_peer" ]] || die "Tunnel IP and peer IP are not in the same /${CIDR} network."
+  fi
+  if [[ "$CIDR" == "30" ]]; then
+    tun_i="$(ip_to_int "$TUN_IP")"
+    net_i=$(( tun_i & 0xFFFFFFFC ))
+    bcast_i=$(( net_i + 3 ))
+    net_ip="$(int_to_ip "$net_i")"
+    bcast_ip="$(int_to_ip "$bcast_i")"
+    [[ "$TUN_IP" != "$net_ip" && "$TUN_IP" != "$bcast_ip" ]] || die "For /30, the tunnel IP cannot be the network or broadcast address."
+    [[ "$PEER_IP" != "$net_ip" && "$PEER_IP" != "$bcast_ip" ]] || die "For /30, the peer IP cannot be the network or broadcast address."
+  fi
+}
+
+write_tunnel_conf_v6() {
+  local old_umask
+  old_umask="$(umask)"
+  umask 077
+  cat >"$CONF" <<EOF
+PROTO="gre6"
+TUN_NAME="${TUN_NAME}"
+LOCAL_IP="${LOCAL_IP}"
+REMOTE_IP="${REMOTE_IP}"
+TUN_IP="${TUN_IP}"
+PEER_IP="${PEER_IP}"
+CIDR="${CIDR}"
+MTU="${MTU}"
+ROLE="${ROLE}"
+PORTS="${PORTS}"
+SPEED="${SPEED}"
+EOF
+  chmod 600 "$CONF"
+  umask "$old_umask"
+}
+
+collect_tunnel_answers_v6() {
+  local detected=""
+  CIDR="${CIDR:-30}"
+  MTU="${MTU:-1456}"
+  TUN_NAME="${TUN_NAME:-oxytunnel}"
+  echo
+  echo "GRE v6 setup is experimental."
+  echo "Public addresses are IPv6. Tunnel addresses stay IPv4, and Iran still forwards the ports you enter."
+  echo "Choose iran or foreign first. Press Enter to accept a value shown in brackets."
+  echo "Set the same values, swapped, on the other server."
+  echo
+  if [[ "${ROLE_SET:-0}" -eq 1 || -n "${ROLE:-}" ]]; then
+    ROLE="$(normalize_role "${ROLE:-}")" || die "Invalid role. Use iran or foreign."
+  elif [[ -t 0 ]]; then
+    while true; do
+      ask_line ROLE "Role of this server (iran or foreign)"
+      if ROLE="$(normalize_role "$ROLE")"; then
+        break
+      fi
+      echo "Enter iran or foreign."
+      ROLE=""
+    done
+  else
+    die "GRE v6 setup needs a terminal."
+  fi
+  detected="$(detect_local_ipv6 || true)"
+  while ! is_global_ipv6 "${LOCAL_IP:-}"; do
+    if [[ -t 0 ]]; then
+      ask_line LOCAL_IP "Public IPv6 of this server" "$detected"
+    else
+      die "Missing public IPv6 of this server."
+    fi
+  done
+  while ! is_global_ipv6 "${REMOTE_IP:-}"; do
+    if [[ -t 0 ]]; then
+      ask_line REMOTE_IP "Public IPv6 of the other server"
+    else
+      die "Missing public IPv6 of the other server."
+    fi
+  done
+  while ! is_ipv4 "${TUN_IP:-}"; do
+    if [[ -t 0 ]]; then
+      ask_line TUN_IP "Tunnel IP on this server"
+    else
+      die "Missing tunnel IP."
+    fi
+  done
+  while ! is_ipv4 "${PEER_IP:-}"; do
+    if [[ -t 0 ]]; then
+      ask_line PEER_IP "Tunnel IP on the other server"
+    else
+      die "Missing peer tunnel IP."
+    fi
+  done
+  if [[ "$ROLE" == "iran" ]]; then
+    PORTS=""
+    while [[ -z "$PORTS" ]]; do
+      ask_line PORTS "Ports to forward (example: 443 8443)"
+      if ! PORTS="$(parse_ports "$PORTS")"; then
+        echo "Use ports from 1 to 65535, separated by spaces or commas."
+        PORTS=""
+        continue
+      fi
+      if [[ -z "$PORTS" ]]; then
+        echo "Enter at least one port."
+      fi
+    done
+  else
+    PORTS=""
+  fi
+  echo "normal keeps the standard tunnel. fast uses the full link (MSS clamp and BBR)."
+  echo "Set the same speed on both servers."
+  while true; do
+    ask_line SPEED "Speed (normal or fast)" "normal"
+    if SPEED="$(normalize_speed "$SPEED")"; then
+      break
+    fi
+    echo "Enter normal or fast."
+    SPEED=""
+  done
+}
+
+bring_up_v6() {
+  local disabled
+  command -v ip >/dev/null 2>&1 || die "Missing dependency: ip (iproute2)"
+  is_global_ipv6 "${LOCAL_IP:-}" || die "LOCAL_IP is not a global IPv6 address"
+  is_global_ipv6 "${REMOTE_IP:-}" || die "REMOTE_IP is not a global IPv6 address"
+  is_ipv4 "${TUN_IP:-}" || die "TUN_IP is invalid"
+  [[ "${MTU:-}" =~ ^[0-9]+$ ]] || die "MTU is invalid"
+  [[ "${CIDR:-}" =~ ^([0-9]|[12][0-9]|3[0-2])$ ]] || die "CIDR is invalid"
+  disabled="$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo 0)"
+  [[ "$disabled" == "0" ]] || die "IPv6 is disabled on this server."
+  modprobe ip6_gre 2>/dev/null || true
+  ip -6 tunnel del "$TUN_NAME" 2>/dev/null || true
+  ip tunnel del "$TUN_NAME" 2>/dev/null || true
+  ip link del "$TUN_NAME" 2>/dev/null || true
+  if ! ip -6 tunnel add "$TUN_NAME" mode ip6gre remote "$REMOTE_IP" local "$LOCAL_IP" ttl 255; then
+    die "GRE v6 is experimental and the interface was not created. Check that this server has global IPv6 and that ip6gre is available."
+  fi
+  ip link set "$TUN_NAME" mtu "$MTU" up
+  ip addr replace "${TUN_IP}/${CIDR}" dev "$TUN_NAME"
+  tune_interface
+  log_event notice "experimental GRE v6 ${TUN_NAME} local ${LOCAL_IP} remote ${REMOTE_IP}"
+}
+
+bring_down_v6() {
+  if [[ -n "${TUN_NAME:-}" ]]; then
+    ip -6 tunnel del "$TUN_NAME" 2>/dev/null || true
+    ip tunnel del "$TUN_NAME" 2>/dev/null || true
+    ip link del "$TUN_NAME" 2>/dev/null || true
   fi
 }
