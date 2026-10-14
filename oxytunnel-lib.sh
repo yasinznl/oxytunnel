@@ -959,13 +959,13 @@ bring_up_v6() {
   ip -6 tunnel del "$TUN_NAME" 2>/dev/null || true
   ip tunnel del "$TUN_NAME" 2>/dev/null || true
   ip link del "$TUN_NAME" 2>/dev/null || true
-  if ! ip -6 tunnel add "$TUN_NAME" mode ip6gre remote "$REMOTE_IP" local "$LOCAL_IP" ttl 255; then
+  if ! ip -6 tunnel add "$TUN_NAME" mode ip6gre remote "$REMOTE_IP" local "$LOCAL_IP" ttl 255 encaplimit none; then
     die "GRE v6 is experimental and the interface was not created. Check that this server has global IPv6 and that ip6gre is available."
   fi
   ip link set "$TUN_NAME" mtu "$MTU" up
   ip addr replace "${TUN_IP}/${CIDR}" dev "$TUN_NAME"
   tune_interface
-  log_event notice "experimental GRE v6 ${TUN_NAME} local ${LOCAL_IP} remote ${REMOTE_IP}"
+  log_event notice "experimental GRE v6 ${TUN_NAME} local ${LOCAL_IP} remote ${REMOTE_IP} encaplimit none"
 }
 
 bring_down_v6() {

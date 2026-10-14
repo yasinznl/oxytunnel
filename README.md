@@ -51,7 +51,7 @@ Clients connect to the Iran public IP and the forwarded port. In the foreign pan
 
 ## GRE v6 experimental
 
-`gre6` is experimental. Choose it only when both servers have a global IPv6 address. The tunnel is carried over IPv6 (`ip6gre`). The addresses inside the tunnel stay IPv4, and the Iran server still forwards the ports you enter to the foreign tunnel IP. Clients still connect to the Iran public IPv4 address. Both servers must allow IPv6 protocol 47. GRE v6 is not encrypted. Use the same speed on both servers, then reconnect the client.
+`gre6` is experimental. Choose it only when both servers have a global IPv6 address. The tunnel is carried over IPv6 (`ip6gre`) with `encaplimit none`. The default encapsulation limit of 4 adds a header that some paths drop, which makes the tunnel look down and causes the health check to restart it. The addresses inside the tunnel stay IPv4, and the Iran server still forwards the ports you enter to the foreign tunnel IP. Clients still connect to the Iran public IPv4 address. Both servers must allow IPv6 protocol 47. GRE v6 is not encrypted. Use the same speed on both servers, then reconnect the client.
 
 ## Menu
 
